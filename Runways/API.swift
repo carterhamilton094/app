@@ -32,8 +32,11 @@ struct API {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw NSError(domain: "Runways", code: 1, userInfo: [NSLocalizedDescriptionKey: String(data: data, encoding: .utf8) ?? "Request failed"])
+            let failure = try? JSONDecoder().decode(APIFailure.self, from: data)
+            throw NSError(domain: "Runways", code: 1, userInfo: [NSLocalizedDescriptionKey: failure?.error ?? "The request failed. Please try again."])
         }
         return try JSONDecoder().decode(T.self, from: data)
     }
 }
+
+private struct APIFailure: Decodable { let error: String }

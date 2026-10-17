@@ -1,15 +1,17 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { parseTarget, selectRoutes } from './routes.js';
+import { parseTarget, selectRoutes, retraces } from './routes.js';
+import { runningActivities, targetForRun } from './activities.js';
 const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY } = process.env;
 const port = Number(process.env.PORT || 3000);
+const upstreamFetch = fetch;
 // Development storage only. Restarting the server requires reconnecting Strava.
 const states = new Map(), tickets = new Map(), sessions = new Map(), limits = new Map();
 const opaque = () => randomBytes(32).toString('hex');
 const send = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end(JSON.stringify(body)); };
 const redirect = (res, location) => { res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end(); };
 async function json(url, options) {
-  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(20000) });
+  const response = await upstreamFetch(url, { ...options, signal: AbortSignal.timeout(20000) });
   if (!response.ok) throw new Error(`Upstream service returned ${response.status}`);
   return response.json();
 }
@@ -20,10 +22,37 @@ async function access(session) {
   if (session.tokens.expires_at * 1000 < Date.now() + 60000) session.tokens = await stravaToken({ grant_type: 'refresh_token', refresh_token: session.tokens.refresh_token });
   return session.tokens.access_token;
 }
+async function athleteRuns(session) {
+  if (session.runs && session.runs.expires > Date.now()) return session.runs.value;
+  if (!session.loadingRuns) {
+    session.loadingRuns = (async () => {
+      const activities = await json('https://www.strava.com/api/v3/athlete/activities?per_page=100', {
+        headers: { Authorization: `Bearer ${await access(session)}` }
+      });
+      const value = runningActivities(activities);
+      session.runs = { value, expires: Date.now() + 300000 };
+      return value;
+    })().finally(() => { session.loadingRuns = null; });
+  }
+  return session.loadingRuns;
+}
+async function generateRoutes(target, seeds, original = []) {
+  const paths = [];
+  for (const seed of seeds) {
+    const endpoint = new URL('https://graphhopper.com/api/1/route');
+    endpoint.search = new URLSearchParams({ key: GRAPHHOPPER_KEY, point: `${target.lat},${target.lon}`, profile: 'foot', algorithm: 'round_trip', 'round_trip.distance': String(target.distance), 'round_trip.seed': String(seed), elevation: 'true', points_encoded: 'false' });
+    const result = await json(endpoint);
+    for (const [index, p] of (result.paths || []).entries()) {
+      paths.push({ id: `${seed}-${index}`, name: `Discovery loop ${paths.length + 1}`, distance: p.distance, ascent: p.ascend, coordinates: p.points?.coordinates });
+    }
+  }
+  const distinct = paths.filter(p => !retraces(p.coordinates, original));
+  return selectRoutes(distinct, target);
+}
 setInterval(() => {
   for (const map of [states, tickets, sessions, limits]) for (const [key, value] of map) if (value.expires < Date.now()) map.delete(key);
 }, 60000).unref();
-http.createServer(async (req, res) => {
+export const server = http.createServer(async (req, res) => {
   try {
     if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
     const url = new URL(req.url, 'http://localhost');
@@ -59,8 +88,36 @@ http.createServer(async (req, res) => {
       sessions.delete(key); return send(res, 200, { session: '' });
     }
     if (url.pathname === '/runs') {
-      const activities = await json('https://www.strava.com/api/v3/athlete/activities?per_page=100', { headers: { Authorization: `Bearer ${await access(session)}` } });
-      return send(res, 200, activities.filter(a => ['Run', 'TrailRun', 'VirtualRun'].includes(a.sport_type)).map(({ id, name, distance, total_elevation_gain, moving_time, start_date }) => ({ id, name, distance, total_elevation_gain, moving_time, start_date })));
+      return send(res, 200, await athleteRuns(session));
+    }
+    const match = url.pathname.match(/^\/runs\/(\d+)\/alternatives$/);
+    if (match) {
+      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Configure GraphHopper on the backend to find alternatives' });
+      const workout = targetForRun(await athleteRuns(session), match[1], url.searchParams);
+      if (!workout) return send(res, 404, { error: 'Run not found in your recent Strava activities' });
+      let target;
+      try { target = parseTarget(workout.params); }
+      catch { return send(res, 400, { error: 'Set a valid home and radius. Matching supports 2–30 km runs with up to 800 m climbing.' }); }
+      session.matches ??= new Map();
+      const cacheKey = JSON.stringify([match[1], target]);
+      const cached = session.matches.get(cacheKey);
+      if (cached && cached.expires > Date.now()) return send(res, 200, { routes: await cached.result });
+      const now = Date.now();
+      if (!session.feedBudget || session.feedBudget.expires <= now) session.feedBudget = { count: 0, expires: now + 600000 };
+      if (session.feedBudget.count >= 12 || (session.activeMatches || 0) >= 3) {
+        return send(res, 429, { error: 'Route searches are busy or at the current limit. Retry shortly; search allowance resets every ten minutes.' });
+      }
+      // Cache in-flight requests too, so revisiting a card does not spend more quota.
+      session.feedBudget.count++;
+      session.activeMatches = (session.activeMatches || 0) + 1;
+      const result = generateRoutes(target, [11, 29, 47, 83], workout.run.coordinates)
+        .then(routes => routes.slice(0, 2))
+        .catch(error => { session.matches.delete(cacheKey); throw error; })
+        .finally(() => { session.activeMatches--; });
+      session.matches.set(cacheKey, { result, expires: now + 600000 });
+      // Keep per-athlete memory bounded as home settings change.
+      if (session.matches.size > 50) session.matches.delete(session.matches.keys().next().value);
+      return send(res, 200, { routes: await result });
     }
     if (url.pathname === '/routes') {
       if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Configure GRAPHHOPPER_KEY on the server for live route generation' });
@@ -68,15 +125,7 @@ http.createServer(async (req, res) => {
       const rate = limits.get(key);
       if (rate && rate.expires > Date.now()) return send(res, 429, { error: 'Please wait one minute before generating more routes' });
       limits.set(key, { expires: Date.now() + 60000 });
-      const paths = [];
-      // Sequential requests avoid a burst against the routing provider's quota.
-      for (const seed of [11, 29, 47, 83, 107, 139]) {
-        const endpoint = new URL('https://graphhopper.com/api/1/route');
-        endpoint.search = new URLSearchParams({ key: GRAPHHOPPER_KEY, point: `${target.lat},${target.lon}`, profile: 'foot', algorithm: 'round_trip', 'round_trip.distance': String(target.distance), 'round_trip.seed': String(seed), elevation: 'true', points_encoded: 'false' });
-        const result = await json(endpoint);
-        for (const p of result.paths || []) paths.push({ id: String(seed), name: `Discovery loop ${paths.length + 1}`, distance: p.distance, ascent: p.ascend, coordinates: p.points.coordinates });
-      }
-      return send(res, 200, { routes: selectRoutes(paths, target) });
+      return send(res, 200, { routes: await generateRoutes(target, [11, 29, 47, 83, 107, 139]) });
     }
     send(res, 404, { error: 'Not found' });
   } catch { send(res, 502, { error: 'The upstream service could not complete this request. Check server credentials, provider quota and connectivity.' }); }

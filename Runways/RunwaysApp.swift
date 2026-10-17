@@ -7,10 +7,11 @@ import AuthenticationServices
     var body: some Scene { WindowGroup { Dashboard() } }
 }
 
+@MainActor
 struct Dashboard: View {
     @AppStorage("backend") private var backend = "https://your-backend.example.com"
     @State private var token = SessionStore.read() ?? ""
-    @State private var runs = demoRuns
+    @State private var runs: [Run] = SessionStore.read() == nil ? demoRuns : []
     @State private var routes: [Route] = []
     @State private var selected: Route?
     @State private var target = 8.0
@@ -29,19 +30,221 @@ struct Dashboard: View {
         return API(base: url, token: token)
     }
     private var sorted: [Route] { routes.sorted { $0.match(distance: target * 1000, ascent: climb) > $1.match(distance: target * 1000, ascent: climb) } }
+    @State private var activeTab = 0
+    @State private var alternatives: [Int: [Route]] = [:]
+    @State private var alternativeErrors: [Int: String] = [:]
+    @State private var loadingAlternatives: Set<Int> = []
+    @State private var detail: Route?
+    @State private var showingDemo: Bool = SessionStore.read() == nil
+    @State private var syncing = false
+    @State private var feedVersion = UUID()
+    private var hasHome: Bool { UserDefaults.standard.object(forKey: "homeLat") != nil }
+    private var feedContext: String {
+        "\(feedVersion)-\(token)-\(home.latitude)-\(home.longitude)-\(radius)"
+    }
     var body: some View {
-        NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    HStack {
-                        VStack(alignment: .leading, spacing: 6) {
-                            Text("A familiar effort.").font(.largeTitle.bold())
-                            Text("A different way home.").font(.largeTitle.bold()).foregroundStyle(accent)
-                        }
-                        Spacer()
+        TabView(selection: $activeTab) {
+            NavigationStack {
+                homeFeed
+                    .navigationTitle("RUNWAYS")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar { Button { settings = true } label: { Image(systemName: "slider.horizontal.3") } }
+            }
+            .tabItem { Label("Home", systemImage: "house.fill") }.tag(0)
+            NavigationStack {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 20) {
+                        Text("A different way home.").font(.largeTitle.bold()).foregroundStyle(accent)
+                        planner
+                    }.padding(24)
+                }
+                .background(Color(red: 0.055, green: 0.075, blue: 0.065))
+                .navigationTitle("Plan a run")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar { Button { settings = true } label: { Image(systemName: "slider.horizontal.3") } }
+            }
+            .tabItem { Label("Plan", systemImage: "point.topleft.down.to.point.bottomright.curvepath") }.tag(1)
+        }
+        .preferredColorScheme(.dark).tint(accent)
+        .sheet(isPresented: $settings) { settingsView }
+        .sheet(item: $detail) { route in
+            NavigationStack {
+                VStack(alignment: .leading, spacing: 16) {
+                    RunMap(points: route.points, tint: accent, emptyText: "Route map unavailable")
+                    Text(String(format: "%.1f km · %.0f m climb", route.distance / 1000, route.ascent)).font(.headline)
+                    Text(showingDemo ? "Illustrative demo route, not a navigable path." : "Review surface, access and safety before running. Similarity estimates distance and climbing, not physiological effort.").font(.caption).foregroundStyle(.secondary)
+                }.padding().navigationTitle(route.name)
+                    .toolbar { Button("Done") { detail = nil } }
+            }.preferredColorScheme(.dark)
+        }
+        .task {
+            if hasHome {
+                home = .init(latitude: UserDefaults.standard.double(forKey: "homeLat"), longitude: UserDefaults.standard.double(forKey: "homeLon"))
+                camera = .region(.init(center: home, span: .init(latitudeDelta: 0.09, longitudeDelta: 0.09)))
+            }
+            if !token.isEmpty { await sync() }
+        }
+    }
+    private var homeFeed: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Your running, lately.").font(.largeTitle.bold())
+                    Text("Same effort. New surroundings.").foregroundStyle(accent)
+                }
+                Text(showingDemo ? "DEMO DATA · Example runs and illustrative maps" : "YOUR STRAVA TRAINING")
+                    .font(.caption.bold()).foregroundStyle(.secondary)
+                if syncing { ProgressView("Refreshing runs…") }
+                trend
+                HStack {
+                    Text("Recent runs").font(.title2.bold())
+                    Spacer()
+                    Button(showingDemo ? "Connect" : "Refresh") {
+                        if showingDemo { settings = true } else { Task { await sync() } }
+                    }.disabled(syncing)
+                }
+                if !showingDemo {
+                    Button { activeTab = 1 } label: {
+                        Label(hasHome ? String(format: "Alternatives within %.1f km of home · Edit", radius) : "Set home in Plan to find matched alternatives", systemImage: "house")
+                            .font(.caption)
                     }
-                    Text(token.isEmpty ? "DEMO DATA · Connect Strava for your running history" : "YOUR STRAVA TRAINING").font(.caption.bold()).foregroundStyle(.secondary)
-                    trend
+                }
+                if let message { Text(message).font(.callout).foregroundStyle(.orange) }
+                if runs.isEmpty {
+                    Text(token.isEmpty ? "Connect Strava to see your runs." : "No runs loaded. Refresh to try again.")
+                        .foregroundStyle(.secondary).padding(.vertical)
+                }
+                ForEach(runs) { run in
+                    feedCard(run)
+                        .task(id: feedContext) { await loadAlternatives(for: run, context: feedContext) }
+                }
+                Text("Matches compare distance (70%) and climbing (30%). Terrain and conditions affect effort. Always review a route before running.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }.padding(24)
+        }
+        .background(Color(red: 0.055, green: 0.075, blue: 0.065))
+        .refreshable { if !token.isEmpty { await sync() } }
+    }
+    private func feedCard(_ run: Run) -> some View {
+        let matches = showingDemo ? demoAlternatives(for: run) : alternatives[run.id] ?? []
+        return VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top) {
+                Image(systemName: "figure.run").foregroundStyle(accent).padding(.top, 3)
+                VStack(alignment: .leading, spacing: 5) {
+                    Text(run.name).font(.headline)
+                    Text(run.dateLabel).font(.caption).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+            RunMap(points: run.points, tint: accent, emptyText: "No route map shared for this run")
+                .frame(height: 190)
+            HStack {
+                runStat("DISTANCE", String(format: "%.1f km", run.km))
+                Spacer()
+                runStat("ELEVATION", String(format: "%.0f m", run.total_elevation_gain))
+                Spacer()
+                runStat("PACE", "\(run.pace) /km")
+            }
+            Divider().overlay(.white.opacity(0.1))
+            HStack {
+                Text(showingDemo ? "EXAMPLE ALTERNATIVES" : "MATCHED ALTERNATIVES")
+                    .font(.caption2.bold()).tracking(1)
+                Spacer()
+                if loadingAlternatives.contains(run.id) { ProgressView().controlSize(.small) }
+            }
+            HStack(alignment: .top, spacing: 10) {
+                ForEach(0..<2, id: \.self) { index in
+                    if index < matches.count {
+                        alternativeTile(matches[index], run: run)
+                    } else {
+                        alternativePlaceholder(run, index: index, count: matches.count)
+                    }
+                }
+            }
+            if let error = alternativeErrors[run.id], !showingDemo {
+                Text(error).font(.caption).foregroundStyle(.secondary)
+                if hasHome && !loadingAlternatives.contains(run.id) {
+                    Button("Retry alternatives") {
+                        alternativeErrors[run.id] = nil
+                        alternatives[run.id] = nil
+                        Task { await loadAlternatives(for: run, context: feedContext) }
+                    }.font(.caption)
+                }
+            }
+            Button("Use this effort in Plan") {
+                target = min(30, max(2, run.km))
+                climb = min(800, max(0, run.total_elevation_gain))
+                routes = []; selected = nil; activeTab = 1
+            }.font(.caption.bold())
+        }
+        .padding(16).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 24))
+    }
+    private func runStat(_ label: String, _ value: String) -> some View {
+        VStack(alignment: .leading, spacing: 5) {
+            Text(label).font(.system(size: 9, weight: .semibold)).foregroundStyle(.secondary)
+            Text(value).font(.subheadline.bold()).monospacedDigit()
+        }
+    }
+    private func alternativeTile(_ route: Route, run: Run) -> some View {
+        Button { detail = route } label: {
+            VStack(alignment: .leading, spacing: 7) {
+                RunMap(points: route.points, tint: accent, emptyText: "Map unavailable").frame(height: 105)
+                Text(route.name).font(.caption.bold()).lineLimit(1)
+                Text(String(format: "%.1f km · %.0f m ↑", route.distance / 1000, route.ascent))
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("\(route.match(distance: run.distance, ascent: run.total_elevation_gain))% similar")
+                    .font(.caption.bold()).foregroundStyle(accent)
+            }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
+        }.buttonStyle(.plain)
+    }
+    private func alternativePlaceholder(_ run: Run, index: Int, count: Int) -> some View {
+        let text: String
+        if showingDemo { text = "Example map" }
+        else if !hasHome { text = "Set home in Plan" }
+        else if loadingAlternatives.contains(run.id) { text = "Finding a match…" }
+        else if count > 0 { text = "No second match found" }
+        else { text = "No match available" }
+        return VStack(alignment: .leading, spacing: 7) {
+            RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.04))
+                .frame(height: 105)
+                .overlay {
+                    VStack(spacing: 7) {
+                        Image(systemName: "map").font(.title3)
+                        Text(text).font(.caption2).multilineTextAlignment(.center)
+                    }.foregroundStyle(.secondary).padding(8)
+                }
+            Text("Alternative \(index + 1)").font(.caption).foregroundStyle(.secondary)
+        }.frame(maxWidth: .infinity, alignment: .leading)
+    }
+    private func loadAlternatives(for run: Run, context: String) async {
+        guard !showingDemo, !token.isEmpty, hasHome, let api,
+              alternatives[run.id] == nil, alternativeErrors[run.id] == nil,
+              !loadingAlternatives.contains(run.id) else { return }
+        guard (2000...30000).contains(run.distance), (0...800).contains(run.total_elevation_gain) else {
+            alternativeErrors[run.id] = "Automatic matches currently support runs from 2–30 km with up to 800 m climbing."
+            return
+        }
+        loadingAlternatives.insert(run.id)
+        defer { if context == feedContext { loadingAlternatives.remove(run.id) } }
+        do {
+            let values = ["lat": home.latitude, "lon": home.longitude, "radius": radius * 1000]
+            let query = values.map { URLQueryItem(name: $0.key, value: String($0.value)) }
+            let result: RouteResponse = try await api.get("runs/\(run.id)/alternatives", query: query)
+            guard context == feedContext, !Task.isCancelled else { return }
+            alternatives[run.id] = Array(result.routes.prefix(2))
+            if result.routes.isEmpty { alternativeErrors[run.id] = "No similar loops found in your home radius. Try changing it in Plan." }
+        } catch {
+            guard context == feedContext else { return }
+            if Task.isCancelled { return }
+            alternativeErrors[run.id] = error.localizedDescription
+        }
+    }
+    private func resetFeedMatches() {
+        alternatives = [:]; alternativeErrors = [:]; loadingAlternatives = []
+        feedVersion = UUID()
+    }
+    private var planner: some View {
+        VStack(alignment: .leading, spacing: 16) {
                     VStack(alignment: .leading, spacing: 16) {
                         Text("Plan your next run").font(.title2.bold())
                         Text("Match a planned workout, then explore a new loop.").font(.subheadline).foregroundStyle(.secondary)
@@ -61,6 +264,7 @@ struct Dashboard: View {
                                     home = coordinate; routes = []; selected = nil; pickingHome = false
                                     UserDefaults.standard.set(home.latitude, forKey: "homeLat")
                                     UserDefaults.standard.set(home.longitude, forKey: "homeLon")
+                                    resetFeedMatches()
                                 }
                             }
                         }.frame(height: 260).clipShape(RoundedRectangle(cornerRadius: 20))
@@ -82,25 +286,10 @@ struct Dashboard: View {
                             }.buttonStyle(.plain)
                         }
                     }
-                    Text("Recent runs").font(.title2.bold())
-                    ForEach(runs.prefix(6)) { run in
-                        Button { target = run.km; climb = run.total_elevation_gain } label: {
-                            HStack { Image(systemName: "figure.run").foregroundStyle(accent); VStack(alignment: .leading) { Text(run.name); Text(String(format: "%.1f km · %.0f m · %@ /km", run.km, run.total_elevation_gain, run.pace)).font(.caption).foregroundStyle(.secondary) }; Spacer(); Image(systemName: "arrow.up.left") }.padding(.vertical, 8)
-                        }.buttonStyle(.plain)
-                    }
-                    Text("Tap a recent run to use its distance and climbing as your target. Route generation requires a configured backend; demo history does not represent your Strava account.").font(.caption).foregroundStyle(.secondary)
-                }.padding(24)
-            }.background(Color(red: 0.055, green: 0.075, blue: 0.065)).navigationTitle("RUNWAYS").navigationBarTitleDisplayMode(.inline)
-                .toolbar { Button { settings = true } label: { Image(systemName: "slider.horizontal.3") } }
-                .sheet(isPresented: $settings) { settingsView }
-                .task {
-                    if UserDefaults.standard.object(forKey: "homeLat") != nil {
-                        home = .init(latitude: UserDefaults.standard.double(forKey: "homeLat"), longitude: UserDefaults.standard.double(forKey: "homeLon"))
-                        camera = .region(.init(center: home, span: .init(latitudeDelta: 0.09, longitudeDelta: 0.09)))
-                    }
-                    if !token.isEmpty { await sync() }
-                }
-        }.preferredColorScheme(.dark).tint(accent)
+        }
+        .onChange(of: radius) { _, _ in resetFeedMatches(); routes = []; selected = nil }
+        .onChange(of: target) { _, _ in routes = []; selected = nil }
+        .onChange(of: climb) { _, _ in routes = []; selected = nil }
     }
     private var trend: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -122,6 +311,9 @@ struct Dashboard: View {
                 if !token.isEmpty { Button("Refresh runs") { Task { await sync() } }; Button("Disconnect", role: .destructive) { Task { await disconnect() } } }
             }
             if let message { Text(message) }
+        }.onChange(of: backend) { _, _ in
+            token = ""; SessionStore.save(nil); runs = demoRuns; showingDemo = true
+            resetFeedMatches(); routes = []; selected = nil
         }.navigationTitle("Connections").toolbar { Button("Done") { settings = false } } }
     }
     private func connect() {
@@ -133,7 +325,8 @@ struct Dashboard: View {
                 }
                 do {
                     let result: Session = try await api.get("auth/exchange", query: [.init(name: "ticket", value: ticket)])
-                    token = result.session; SessionStore.save(token); await sync()
+                    token = result.session; SessionStore.save(token)
+                    showingDemo = false; runs = []; resetFeedMatches(); await sync()
                 } catch { message = error.localizedDescription }
             }
         }
@@ -144,23 +337,61 @@ struct Dashboard: View {
     }
     private func sync() async {
         guard let api else { return }
-        do { let result: [Run] = try await api.get("runs"); runs = result; message = result.isEmpty ? "No runs found in the latest 100 activities." : nil }
+        guard !syncing else { return }
+        syncing = true
+        let requestedToken = token
+        let requestedBackend = backend
+        defer { syncing = false }
+        do {
+            let result: [Run] = try await api.get("runs")
+            guard token == requestedToken, backend == requestedBackend else { return }
+            runs = result; showingDemo = false; resetFeedMatches()
+            message = result.isEmpty ? "No runs found in the latest 100 activities." : nil
+        }
         catch { message = error.localizedDescription }
     }
     private func disconnect() async {
         guard let api else { return }
-        do { let _: Session = try await api.get("disconnect"); token = ""; SessionStore.save(nil); runs = demoRuns; message = nil }
+        do { let _: Session = try await api.get("disconnect"); token = ""; SessionStore.save(nil); runs = demoRuns; showingDemo = true; resetFeedMatches(); message = nil }
         catch { message = error.localizedDescription }
     }
     private func findRoutes() async {
+        guard hasHome else { message = "Choose your home on the map before finding routes."; return }
         guard let api, !token.isEmpty else { message = "Connect Strava in Connections to generate live routes. Demo history is for exploring the interface."; return }
         busy = true; message = nil
+        let requestedContext = feedContext
+        let requestedTarget = target
+        let requestedClimb = climb
         defer { busy = false }
         do {
             let response: RouteResponse = try await api.get("routes", query: ["lat": home.latitude, "lon": home.longitude, "distance": target * 1000, "ascent": climb, "radius": radius * 1000].map { .init(name: $0.key, value: String($0.value)) })
+            guard feedContext == requestedContext, target == requestedTarget, climb == requestedClimb else { return }
             routes = response.routes; selected = sorted.first; camera = .automatic
             if routes.isEmpty { message = "No matching loops fit this radius. Increase the radius or adjust the distance and climbing." }
         } catch { message = error.localizedDescription }
+    }
+}
+struct RunMap: View {
+    let points: [CLLocationCoordinate2D]
+    let tint: Color
+    let emptyText: String
+    var body: some View {
+        Group {
+            if points.count >= 2 {
+                Map(initialPosition: .automatic, interactionModes: []) {
+                    MapPolyline(coordinates: points).stroke(tint, lineWidth: 4)
+                }
+                .mapStyle(.standard(elevation: .flat, pointsOfInterest: .excludingAll))
+                .allowsHitTesting(false)
+                .accessibilityLabel("Run route map")
+            } else {
+                Rectangle().fill(.white.opacity(0.04))
+                    .overlay {
+                        Label(emptyText, systemImage: "map")
+                            .font(.caption).foregroundStyle(.secondary).padding()
+                    }
+            }
+        }.clipShape(RoundedRectangle(cornerRadius: 14))
     }
 }
 final class AuthWindow: NSObject, ASWebAuthenticationPresentationContextProviding {

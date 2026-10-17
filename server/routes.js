@@ -30,3 +30,12 @@ export function parseTarget(params) {
   }
   return result;
 }
+
+// Reject a candidate that mostly retraces the recorded run, including its reverse.
+export function retraces(candidate, original) {
+  if (!original?.length || !candidate?.length) return false;
+  const sample = points => points.filter((_, i) => i % Math.max(1, Math.floor(points.length / 100)) === 0);
+  const left = sample(candidate), right = sample(original);
+  const coverage = (a, b) => a.filter(p => b.some(q => meters(p, q) < 60)).length / a.length;
+  return coverage(left, right) > .85 && coverage(right, left) > .85;
+}
