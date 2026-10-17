@@ -25,10 +25,17 @@ struct API {
     let base: URL
     let token: String
     func get<T: Decodable>(_ path: String, query: [URLQueryItem] = []) async throws -> T {
+        try await request(path, method: "GET", query: query)
+    }
+    func post<T: Decodable>(_ path: String) async throws -> T {
+        try await request(path, method: "POST")
+    }
+    private func request<T: Decodable>(_ path: String, method: String, query: [URLQueryItem] = []) async throws -> T {
         var parts = URLComponents(url: base.appendingPathComponent(path), resolvingAgainstBaseURL: false)!
         parts.queryItems = query
         var request = URLRequest(url: parts.url!)
         request.timeoutInterval = 180
+        request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {

@@ -22,3 +22,20 @@ targets:
           - CFBundleURLSchemes: [runways]
         NSAppTransportSecurity:
           NSAllowsLocalNetworking: true
+  RunwaysTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources: [RunwaysTests]
+    dependencies:
+      - target: Runways
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.runways.app.tests
+schemes:
+  Runways:
+    build:
+      targets:
+        Runways: all
+    test:
+      targets: [RunwaysTests]

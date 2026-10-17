@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { parseTarget, selectRoutes, retraces } from './routes.js';
-import { runningActivities, targetForRun } from './activities.js';
+import { runningActivities, targetForRun, appendRouteNote, historyPage } from './activities.js';
 const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY } = process.env;
 const port = Number(process.env.PORT || 3000);
 const upstreamFetch = fetch;
@@ -19,7 +19,13 @@ async function stravaToken(fields) {
   return json('https://www.strava.com/oauth/token', { method: 'POST', body: new URLSearchParams({ client_id: STRAVA_CLIENT_ID, client_secret: STRAVA_CLIENT_SECRET, ...fields }) });
 }
 async function access(session) {
-  if (session.tokens.expires_at * 1000 < Date.now() + 60000) session.tokens = await stravaToken({ grant_type: 'refresh_token', refresh_token: session.tokens.refresh_token });
+  if (session.tokens.expires_at * 1000 < Date.now() + 60000) {
+    session.athleteID ??= session.tokens.athlete?.id;
+    session.refresh ??= stravaToken({ grant_type: 'refresh_token', refresh_token: session.tokens.refresh_token })
+      .then(tokens => { session.tokens = tokens; })
+      .finally(() => { session.refresh = null; });
+    await session.refresh;
+  }
   return session.tokens.access_token;
 }
 async function athleteRuns(session) {
@@ -54,14 +60,16 @@ setInterval(() => {
 }, 60000).unref();
 export const server = http.createServer(async (req, res) => {
   try {
-    if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
     const url = new URL(req.url, 'http://localhost');
+    const noteMatch = url.pathname.match(/^\/runs\/(\d+)\/note$/);
+    if (req.method !== 'GET' && !(req.method === 'POST' && noteMatch)) return send(res, 405, { error: 'Method not allowed' });
     if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY) });
     if (url.pathname === '/auth/strava') {
       if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !PUBLIC_URL) return send(res, 503, { error: 'Configure Strava on the server first' });
-      const state = opaque(); states.set(state, { expires: Date.now() + 600000 });
+      const write = url.searchParams.get('write') === '1';
+      const state = opaque(); states.set(state, { write, expires: Date.now() + 600000 });
       const auth = new URL('https://www.strava.com/oauth/authorize');
-      auth.search = new URLSearchParams({ client_id: STRAVA_CLIENT_ID, redirect_uri: `${PUBLIC_URL.replace(/\/$/, '')}/auth/callback`, response_type: 'code', approval_prompt: 'auto', scope: 'read,activity:read_all', state });
+      auth.search = new URLSearchParams({ client_id: STRAVA_CLIENT_ID, redirect_uri: `${PUBLIC_URL.replace(/\/$/, '')}/auth/callback`, response_type: 'code', approval_prompt: write ? 'force' : 'auto', scope: write ? 'read,activity:read_all,activity:write' : 'read,activity:read_all', state });
       res.setHeader('Set-Cookie', `runways_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`);
       return redirect(res, auth.toString());
     }
@@ -72,17 +80,65 @@ export const server = http.createServer(async (req, res) => {
       states.delete(state);
       if (!url.searchParams.get('code') || !url.searchParams.get('scope')?.split(',').includes('activity:read_all')) return send(res, 400, { error: 'Activity access was not granted. Reconnect and allow activity access.' });
       const tokens = await stravaToken({ grant_type: 'authorization_code', code: url.searchParams.get('code') });
-      const ticket = opaque(); tickets.set(ticket, { tokens, expires: Date.now() + 60000 });
+      const scopes = url.searchParams.get('scope').split(',').filter(scope => scope !== 'activity:write' || pending.write);
+      const ticket = opaque(); tickets.set(ticket, { tokens, scopes, expires: Date.now() + 60000 });
       return redirect(res, `runways://connected?ticket=${ticket}`);
     }
     if (url.pathname === '/auth/exchange') {
       const ticket = url.searchParams.get('ticket'), entry = tickets.get(ticket); tickets.delete(ticket);
       if (!entry || entry.expires < Date.now()) return send(res, 401, { error: 'Connection ticket expired' });
-      const session = opaque(); sessions.set(session, { tokens: entry.tokens, expires: Date.now() + 30 * 86400000 });
+      const session = opaque(); sessions.set(session, { tokens: entry.tokens, scopes: entry.scopes, expires: Date.now() + 30 * 86400000 });
       return send(res, 200, { session });
     }
     const key = req.headers.authorization?.replace(/^Bearer /, ''), session = sessions.get(key);
     if (!session || session.expires < Date.now()) return send(res, 401, { error: 'Reconnect Strava to continue' });
+    if (url.pathname === '/account') {
+      return send(res, 200, {
+        athleteID: session.tokens.athlete?.id ?? session.athleteID,
+        writeAuthorized: session.scopes?.includes('activity:write') ?? false,
+        routingConfigured: Boolean(GRAPHHOPPER_KEY)
+      });
+    }
+    if (url.pathname === '/history') {
+      const before = Number(url.searchParams.get('before'));
+      if (!Number.isSafeInteger(before) || before < 946684800 || before > Math.floor(Date.now() / 1000) + 86400) {
+        return send(res, 400, { error: 'Invalid history date' });
+      }
+      session.history ??= new Map();
+      const cached = session.history.get(before);
+      if (cached) return send(res, 200, cached);
+      if (session.history.size >= 100) return send(res, 429, { error: 'History limit reached for this session. Reconnect to continue.' });
+      const activities = await json(`https://www.strava.com/api/v3/athlete/activities?per_page=100&before=${before}`, {
+        headers: { Authorization: `Bearer ${await access(session)}` }
+      });
+      const page = historyPage(activities);
+      session.history.set(before, page);
+      return send(res, 200, page);
+    }
+    if (noteMatch && req.method === 'POST') {
+      if (!session.scopes?.includes('activity:write')) return send(res, 403, { error: 'Enable activity notes in Settings and grant Strava activity-write permission first.' });
+      if (session.noteInFlight) return send(res, 429, { error: 'Another activity update is in progress. Try again shortly.' });
+      session.noteInFlight = true;
+      try {
+        const activityID = noteMatch[1];
+        const activity = await json(`https://www.strava.com/api/v3/activities/${activityID}`, {
+          headers: { Authorization: `Bearer ${await access(session)}` }
+        });
+        const athleteID = session.tokens.athlete?.id ?? session.athleteID;
+        if (!athleteID || activity.athlete?.id !== athleteID || !['Run', 'TrailRun', 'VirtualRun'].includes(activity.sport_type)) {
+          return send(res, 404, { error: 'Completed run not found for this Strava account' });
+        }
+        const description = appendRouteNote(activity.description);
+        const updated = description !== (activity.description ?? '');
+        if (updated) {
+          await json(`https://www.strava.com/api/v3/activities/${activityID}`, {
+            method: 'PUT', headers: { Authorization: `Bearer ${await access(session)}` },
+            body: new URLSearchParams({ description })
+          });
+        }
+        return send(res, 200, { updated, description });
+      } finally { session.noteInFlight = false; }
+    }
     if (url.pathname === '/disconnect') {
       await json('https://www.strava.com/oauth/deauthorize', { method: 'POST', body: new URLSearchParams({ access_token: await access(session) }) });
       sessions.delete(key); return send(res, 200, { session: '' });
@@ -92,7 +148,7 @@ export const server = http.createServer(async (req, res) => {
     }
     const match = url.pathname.match(/^\/runs\/(\d+)\/alternatives$/);
     if (match) {
-      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Configure GraphHopper on the backend to find alternatives' });
+      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Route discovery is not available yet. Your Strava runs and maps still work.' });
       const workout = targetForRun(await athleteRuns(session), match[1], url.searchParams);
       if (!workout) return send(res, 404, { error: 'Run not found in your recent Strava activities' });
       let target;
@@ -120,7 +176,7 @@ export const server = http.createServer(async (req, res) => {
       return send(res, 200, { routes: await result });
     }
     if (url.pathname === '/routes') {
-      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Configure GRAPHHOPPER_KEY on the server for live route generation' });
+      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Route discovery is not available yet. Your Strava runs and maps still work.' });
       let target; try { target = parseTarget(url.searchParams); } catch (e) { return send(res, 400, { error: e.message }); }
       const rate = limits.get(key);
       if (rate && rate.expires > Date.now()) return send(res, 429, { error: 'Please wait one minute before generating more routes' });

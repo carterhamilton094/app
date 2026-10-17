@@ -38,3 +38,17 @@ export function targetForRun(runs, id, params) {
   result.set('ascent', String(run.total_elevation_gain));
   return { run, params: result };
 }
+
+export const routeNote = 'Explored a new loop with Runways.';
+export function appendRouteNote(description) {
+  const original = description ?? '';
+  if (original.split(/\r?\n/).some(line => line.trim() === routeNote)) return original;
+  return original ? `${original}\n\n${routeNote}` : routeNote;
+}
+export function historyPage(activities) {
+  const dates = activities.map(a => Date.parse(a.start_date)).filter(Number.isFinite);
+  return {
+    runs: runningActivities(activities),
+    nextBefore: activities.length === 100 && dates.length ? Math.floor(Math.min(...dates) / 1000) : null
+  };
+}

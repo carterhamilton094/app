@@ -36,3 +36,20 @@ test('recorded route and reverse are not offered as new routes', () => {
   assert.equal(retraces([[1, 1], [1.01, 1.01]], points), false);
   assert.equal(retraces(points, []), false);
 });
+
+test('optional note preserves descriptions and does not duplicate an existing note', async () => {
+  const { appendRouteNote, routeNote } = await import('../activities.js');
+  assert.equal(appendRouteNote(null), routeNote);
+  const original = 'Easy run with friends.\nFelt good!';
+  assert.equal(appendRouteNote(original), `${original}\n\n${routeNote}`);
+  assert.equal(appendRouteNote(`${original}\n\n${routeNote}`), `${original}\n\n${routeNote}`);
+});
+test('history pagination advances using all activities, even when a page has no runs', async () => {
+  const { historyPage } = await import('../activities.js');
+  const rides = Array.from({ length: 100 }, (_, i) => ({ sport_type: 'Ride', start_date: new Date(Date.UTC(2026, 0, 1) - i * 86400000).toISOString() }));
+  const page = historyPage(rides);
+  assert.equal(page.runs.length, 0);
+  assert.equal(page.nextBefore, Date.parse(rides.at(-1).start_date) / 1000);
+  assert.equal(historyPage(rides.slice(0, 20)).nextBefore, null);
+  assert.equal(historyPage([]).nextBefore, null);
+});

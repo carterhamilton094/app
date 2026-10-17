@@ -82,3 +82,113 @@ func demoAlternatives(for run: Run) -> [Route] {
     }
     return results
 }
+
+struct Account: Decodable {
+    let athleteID: Int
+    let writeAuthorized: Bool
+    let routingConfigured: Bool
+}
+struct HistoryPage: Decodable {
+    let runs: [Run]
+    let nextBefore: Int?
+}
+struct NoteResult: Decodable {
+    let updated: Bool
+    let description: String
+}
+struct SavedRoute: Identifiable, Codable {
+    let id: UUID
+    let route: Route
+    let discoveredAt: Date
+    var completedRunID: Int?
+    var noteAdded: Bool = false
+}
+enum RouteLibrary {
+    static func load(athleteID: Int) -> [SavedRoute] {
+        guard let data = UserDefaults.standard.data(forKey: "routes.\(athleteID)") else { return [] }
+        return (try? JSONDecoder().decode([SavedRoute].self, from: data)) ?? []
+    }
+    static func save(_ routes: [SavedRoute], athleteID: Int) {
+        guard let data = try? JSONEncoder().encode(routes) else { return }
+        UserDefaults.standard.set(data, forKey: "routes.\(athleteID)")
+    }
+    static func sameGeometry(_ a: Route, _ b: Route) -> Bool {
+        a.coordinates == b.coordinates
+    }
+}
+extension Run {
+    var date: Date? { ISO8601DateFormatter().date(from: start_date) }
+}
+extension Route {
+    func gpx() throws -> String {
+        guard points.count >= 2 else {
+            throw NSError(domain: "Runways", code: 2, userInfo: [NSLocalizedDescriptionKey: "This route has no exportable map."])
+        }
+        let escapedName = name.replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+            .replacingOccurrences(of: "'", with: "&apos;")
+        var track = ""
+        for point in coordinates {
+            guard point.count >= 2, point[0].isFinite, point[1].isFinite,
+                  abs(point[0]) <= 180, abs(point[1]) <= 90 else { continue }
+            let elevation = point.count >= 3 && point[2].isFinite ? "<ele>\(point[2])</ele>" : ""
+            track += "<trkpt lat=\"\(point[1])\" lon=\"\(point[0])\">\(elevation)</trkpt>\n"
+        }
+        return """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <gpx version="1.1" creator="Runways" xmlns="http://www.topografix.com/GPX/1/1">
+        <metadata><name>\(escapedName)</name></metadata>
+        <trk><name>\(escapedName)</name><trkseg>
+        \(track)</trkseg></trk></gpx>
+        """
+    }
+}
+
+struct HeatCell: Identifiable {
+    let id: String
+    let latitude: Double
+    let longitude: Double
+    let count: Int
+}
+// Count distinct runs through a ~150 m grid, not GPS samples or time spent.
+// Web Mercator gives a consistent grid; long gaps are skipped to respect hidden geometry.
+func heatCells(for runs: [Run]) -> [HeatCell] {
+    let earthRadius = 6_378_137.0
+    let cellSize = 150.0
+    var counts: [String: Int] = [:]
+    var positions: [String: (Double, Double)] = [:]
+    for run in runs {
+        var visited: Set<String> = []
+        var previous: (Double, Double)?
+        for point in run.points {
+            let latitude = min(85.0, max(-85.0, point.latitude)) * .pi / 180
+            let x = earthRadius * point.longitude * .pi / 180
+            let y = earthRadius * log(tan(.pi / 4 + latitude / 2))
+            let start = previous ?? (x, y)
+            let distance = hypot(x - start.0, y - start.1)
+            let steps = distance < 2000 ? min(30, max(1, Int(distance / 75))) : 1
+            for step in 1...steps {
+                let fraction = Double(step) / Double(steps)
+                let sx = start.0 + (x - start.0) * fraction
+                let sy = start.1 + (y - start.1) * fraction
+                let gx = floor(sx / cellSize), gy = floor(sy / cellSize)
+                let key = "\(Int(gx)):\(Int(gy))"
+                visited.insert(key)
+                positions[key] = ((gx + 0.5) * cellSize, (gy + 0.5) * cellSize)
+            }
+            previous = (x, y)
+        }
+        for key in visited { counts[key, default: 0] += 1 }
+    }
+    return counts.keys.sorted {
+        let left = counts[$0, default: 0], right = counts[$1, default: 0]
+        return left == right ? $0 < $1 : left > right
+    }.prefix(5000).compactMap { key in
+        guard let position = positions[key], let count = counts[key] else { return nil }
+        let lon = position.0 / earthRadius * 180 / .pi
+        let lat = (2 * atan(exp(position.1 / earthRadius)) - .pi / 2) * 180 / .pi
+        return HeatCell(id: key, latitude: lat, longitude: lon, count: count)
+    }
+}
