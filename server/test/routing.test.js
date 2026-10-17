@@ -1,17 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createRoutingService } from '../routing.js';
+import { createRoutingService, waypointLoop } from '../routing.js';
+import { meters } from '../routes.js';
 const target = { lat: 0, lon: 0, radius: 5000, distance: 8000, ascent: 100 };
 const path = { distance: 8000, ascend: 100, points: { coordinates: [[0, 0, 10], [.01, .01, 20], [.02, -.01, 10], [0, 0, 10]] } };
 const errorCode = code => error => { assert.equal(error.code, `ROUTING_${code}`); return true; };
 
-test('loop requests use foot routing, elevation, flexible mode and unencoded coordinates', async () => {
+test('default loops use standard multi-point foot routing without flexible-mode options', async () => {
   const generate = createRoutingService({ key: 'test-only', fetcher: async url => {
     assert.equal(url.origin, 'https://graphhopper.com');
-    assert.equal(url.searchParams.get('point'), '0,0');
+    const points = url.searchParams.getAll('point');
+    assert.equal(points.length, 4);
+    assert.equal(points[0], '0,0');
+    assert.equal(points.at(-1), '0,0');
     assert.equal(url.searchParams.get('profile'), 'foot');
-    assert.equal(url.searchParams.get('round_trip.distance'), '8000');
-    assert.equal(url.searchParams.get('ch.disable'), 'true');
+    assert.equal(url.searchParams.has('round_trip.distance'), false);
+    assert.equal(url.searchParams.has('algorithm'), false);
+    assert.equal(url.searchParams.has('ch.disable'), false);
     assert.equal(url.searchParams.get('elevation'), 'true');
     assert.equal(url.searchParams.get('points_encoded'), 'false');
     return Response.json({ paths: [path] });
@@ -93,4 +98,38 @@ test('provider diagnostic sanitization also handles encoded keys and control cha
   assert.equal(result.includes(encodeURIComponent(key)), false);
   assert.equal(result.includes('12.3456'), false);
   assert.equal(result.includes('\n'), false);
+});
+
+test('explicit round_trip mode retains flexible routing for entitled accounts only', async () => {
+  const generate = createRoutingService({ key: 'test-only', mode: 'round_trip', fetcher: async url => {
+    assert.deepEqual(url.searchParams.getAll('point'), ['0,0']);
+    assert.equal(url.searchParams.get('algorithm'), 'round_trip');
+    assert.equal(url.searchParams.get('round_trip.distance'), '8000');
+    assert.equal(url.searchParams.get('ch.disable'), 'true');
+    return Response.json({ paths: [path] });
+  }});
+  assert.equal((await generate(target, [11])).length, 1);
+});
+test('search anchors stay inside the home radius, close at home and vary by seed', () => {
+  const local = { ...target, lat: -27.4698, lon: 153.0251, distance: 30000, radius: 1000 };
+  const first = waypointLoop(local, 11), second = waypointLoop(local, 29);
+  assert.deepEqual(first[0], [local.lat, local.lon]);
+  assert.deepEqual(first.at(-1), first[0]);
+  assert.notDeepEqual(first[1], second[1]);
+  for (const [lat, lon] of first) {
+    assert.ok(meters([local.lon, local.lat], [lon, lat]) <= local.radius * 0.801);
+  }
+});
+test('standard searches still reject real paths outside radius or mismatching workout effort', async () => {
+  const outside = { ...path, points: { coordinates: [[0, 0], [1, 1], [0, 0]] } };
+  const tooLong = { ...path, distance: 14000 };
+  const tooHilly = { ...path, ascend: 500 };
+  for (const invalid of [outside, tooLong, tooHilly]) {
+    const generate = createRoutingService({ key: 'test-only', fetcher: async () => Response.json({ paths: [invalid] }) });
+    assert.deepEqual(await generate(target, [11]), []);
+  }
+});
+test('invalid routing mode fails before spending provider credits', async () => {
+  const generate = createRoutingService({ key: 'test-only', mode: 'unknown', fetcher: () => { throw new Error('Must not run'); } });
+  await assert.rejects(generate(target, [11]), errorCode('MODE'));
 });

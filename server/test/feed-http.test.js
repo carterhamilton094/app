@@ -18,7 +18,9 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
     ]);
     if (url.hostname === 'graphhopper.com') {
       routingCalls++;
-      assert.equal(url.searchParams.get('round_trip.distance'), '8000');
+      assert.equal(url.searchParams.has('ch.disable'), false);
+      assert.equal(url.searchParams.has('algorithm'), false);
+      assert.equal(url.searchParams.getAll('point').length, 4);
       assert.equal(url.searchParams.get('point'), '0,0');
       const shift = routingCalls * .001;
       return Response.json({ paths: [{ distance: 8000, ascend: 100,
@@ -32,6 +34,8 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   if (!server.listening) await new Promise(resolve => server.once('listening', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
+  const health = await nativeFetch(`${base}/health`);
+  assert.equal((await health.json()).routingMode, 'waypoints');
   const unauthorized = await nativeFetch(`${base}/runs/42/alternatives`);
   assert.equal(unauthorized.status, 401);
   const authorization = await nativeFetch(`${base}/auth/strava`, { redirect: 'manual' });

@@ -3,10 +3,11 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { parseTarget } from './routes.js';
 import { createRoutingService, RoutingError } from './routing.js';
 import { runningActivities, targetForRun, appendRouteNote, historyPage } from './activities.js';
-const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY } = process.env;
+const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY, GRAPHHOPPER_ROUTING_MODE } = process.env;
 const port = Number(process.env.PORT || 3000);
 const upstreamFetch = fetch;
-const generateRoutes = createRoutingService({ key: GRAPHHOPPER_KEY, fetcher: upstreamFetch });
+const routingMode = GRAPHHOPPER_ROUTING_MODE || 'waypoints';
+const generateRoutes = createRoutingService({ key: GRAPHHOPPER_KEY, fetcher: upstreamFetch, mode: routingMode });
 // Development storage only. Restarting the server requires reconnecting Strava.
 const states = new Map(), tickets = new Map(), sessions = new Map(), limits = new Map();
 const opaque = () => randomBytes(32).toString('hex');
@@ -52,7 +53,7 @@ export const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const noteMatch = url.pathname.match(/^\/runs\/(\d+)\/note$/);
     if (req.method !== 'GET' && !(req.method === 'POST' && noteMatch)) return send(res, 405, { error: 'Method not allowed' });
-    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim()) });
+    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim()), routingMode });
     if (url.pathname === '/auth/strava') {
       if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !PUBLIC_URL) return send(res, 503, { error: 'Configure Strava on the server first' });
       const write = url.searchParams.get('write') === '1';

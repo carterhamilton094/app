@@ -1,6 +1,7 @@
 import { selectRoutes, retraces } from './routes.js';
 
 const failures = {
+  MODE: [503, 'The route service has an invalid routing mode. Use waypoints or round_trip in Render.'],
   NOT_CONFIGURED: [503, 'Route discovery is not available yet. Your Strava runs and maps still work.'],
   ACCESS: [503, 'The route service could not authenticate. Check the GraphHopper key and its routing access in Render.'],
   QUOTA: [503, 'The route service has reached its request allowance. Please try again later.'],
@@ -44,18 +45,41 @@ function validPath(path) {
     Array.isArray(coordinates) && coordinates.length >= 3 &&
     coordinates.every(point => Array.isArray(point) && point.length >= 2 && point.every(Number.isFinite) && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90);
 }
-export function createRoutingService({ key, fetcher = fetch }) {
+// Standard multi-point routing avoids the flexible-mode round-trip algorithm.
+// These points are only search anchors; the provider supplies the actual footpath geometry.
+export function waypointLoop(target, seed) {
+  const earthRadius = 6371000;
+  const bearing = ((seed * 137.507764) % 360) * Math.PI / 180;
+  const scale = 0.8 + ((seed % 5) - 2) * 0.04;
+  const leg = Math.min(target.distance / 3 * scale, target.radius * 0.8);
+  const lat = target.lat * Math.PI / 180, lon = target.lon * Math.PI / 180;
+  const destination = angle => {
+    const delta = leg / earthRadius;
+    const nextLat = Math.asin(Math.sin(lat) * Math.cos(delta) + Math.cos(lat) * Math.sin(delta) * Math.cos(angle));
+    const nextLon = lon + Math.atan2(Math.sin(angle) * Math.sin(delta) * Math.cos(lat), Math.cos(delta) - Math.sin(lat) * Math.sin(nextLat));
+    return [nextLat * 180 / Math.PI, ((nextLon * 180 / Math.PI + 540) % 360) - 180];
+  };
+  return [[target.lat, target.lon], destination(bearing), destination(bearing + Math.PI / 3), [target.lat, target.lon]];
+}
+export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' }) {
   return async function generateRoutes(target, seeds, original = []) {
     if (!key?.trim()) throw new RoutingError('NOT_CONFIGURED');
+    if (!['waypoints', 'round_trip'].includes(mode)) throw new RoutingError('MODE');
     const paths = [];
     for (const seed of seeds) {
       const endpoint = new URL('https://graphhopper.com/api/1/route');
-      endpoint.search = new URLSearchParams({
-        key, point: `${target.lat},${target.lon}`, profile: 'foot',
-        algorithm: 'round_trip', 'round_trip.distance': String(target.distance),
-        'round_trip.seed': String(seed), 'ch.disable': 'true',
-        elevation: 'true', points_encoded: 'false', instructions: 'false'
-      });
+      const query = new URLSearchParams({ key, profile: 'foot', elevation: 'true', points_encoded: 'false', instructions: 'false' });
+      if (mode === 'round_trip') {
+        // Optional paid/entitled mode, explicitly selected by the operator.
+        query.set('point', `${target.lat},${target.lon}`);
+        query.set('algorithm', 'round_trip');
+        query.set('round_trip.distance', String(target.distance));
+        query.set('round_trip.seed', String(seed));
+        query.set('ch.disable', 'true');
+      } else {
+        for (const [lat, lon] of waypointLoop(target, seed)) query.append('point', `${lat},${lon}`);
+      }
+      endpoint.search = query;
       let response;
       try {
         response = await fetcher(endpoint, { signal: AbortSignal.timeout(20000) });
