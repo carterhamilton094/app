@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import CoreLocation
 @testable import Runways
 
 final class RouteFeaturesTests: XCTestCase {
@@ -50,6 +51,20 @@ final class RouteFeaturesTests: XCTestCase {
         let different = Route(id: "11-0", name: "Different loop", distance: 8000, ascent: 100,
                               coordinates: [[154, -27], [154.01, -27.01]])
         XCTAssertFalse(RouteLibrary.sameGeometry(route, different), "Provider seed IDs must not merge different routes")
+    }
+    func testSavedMatchingReusesOnlyRoutesWithCorrectEffortRadiusAndStart() {
+        let route = Route(id: "saved", name: "Local loop", distance: 8000, ascent: 100,
+                          coordinates: [[0, 0], [0.01, 0.01], [0.01, -0.01], [0, 0]])
+        let saved = SavedRoute(id: UUID(), route: route, discoveredAt: Date())
+        let home = CLLocationCoordinate2D(latitude: 0, longitude: 0)
+        XCTAssertEqual(SavedRouteMatcher.matches([saved], distance: 8000, ascent: 100, home: home, radius: 5000).count, 1)
+        XCTAssertTrue(SavedRouteMatcher.matches([saved], distance: 3000, ascent: 100, home: home, radius: 5000).isEmpty)
+        XCTAssertTrue(SavedRouteMatcher.matches([saved], distance: 8000, ascent: 500, home: home, radius: 5000).isEmpty)
+        XCTAssertTrue(SavedRouteMatcher.matches([saved], distance: 8000, ascent: 100, home: home, radius: 500).isEmpty)
+        let otherHome = CLLocationCoordinate2D(latitude: 1, longitude: 1)
+        XCTAssertTrue(SavedRouteMatcher.matches([saved], distance: 8000, ascent: 100, home: otherHome, radius: 500000).isEmpty)
+        let original = run(id: 99, points: route.coordinates)
+        XCTAssertTrue(SavedRouteMatcher.matches([saved], distance: 8000, ascent: 100, home: home, radius: 5000, excluding: original).isEmpty)
     }
     private func run(id: Int, points: [[Double]]) -> Run {
         Run(id: id, name: "Test", distance: 1000, total_elevation_gain: 0,

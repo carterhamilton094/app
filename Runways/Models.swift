@@ -196,3 +196,46 @@ func heatCells(for runs: [Run]) -> [HeatCell] {
         return HeatCell(id: key, latitude: lat, longitude: lon, count: count)
     }
 }
+
+// Local matching spends no routing credits and applies the same strict workout limits.
+enum SavedRouteMatcher {
+    static func matches(_ library: [SavedRoute], distance: Double, ascent: Double,
+                        home: CLLocationCoordinate2D, radius: Double, excluding run: Run? = nil) -> [Route] {
+        guard distance > 0, radius > 0 else { return [] }
+        var found: [Route] = []
+        for saved in library {
+            let route = saved.route
+            guard route.distance.isFinite, route.distance > 0, route.ascent.isFinite, route.ascent >= 0,
+                  abs(route.distance - distance) / distance <= 0.2,
+                  abs(route.ascent - ascent) <= max(40, ascent * 0.35),
+                  route.coordinates.count >= 3,
+                  route.points.count == route.coordinates.count else { continue }
+            let points = route.points
+            guard let first = points.first, let last = points.last,
+                  metres(home, first) <= 200, metres(first, last) <= 200,
+                  points.allSatisfy({ metres(home, $0) <= radius }) else { continue }
+            if let run, retraces(points, run.points) { continue }
+            if !found.contains(where: { RouteLibrary.sameGeometry($0, route) }) { found.append(route) }
+        }
+        return found.sorted { $0.match(distance: distance, ascent: ascent) > $1.match(distance: distance, ascent: ascent) }
+    }
+    private static func metres(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+        let factor = Double.pi / 180
+        let dLat = (b.latitude - a.latitude) * factor
+        let dLon = (b.longitude - a.longitude) * factor
+        let h = pow(sin(dLat / 2), 2) + cos(a.latitude * factor) * cos(b.latitude * factor) * pow(sin(dLon / 2), 2)
+        return 12_742_000 * atan2(sqrt(max(0, h)), sqrt(max(0, 1 - h)))
+    }
+    private static func retraces(_ route: [CLLocationCoordinate2D], _ original: [CLLocationCoordinate2D]) -> Bool {
+        guard !original.isEmpty, !route.isEmpty else { return false }
+        func sample(_ points: [CLLocationCoordinate2D]) -> [CLLocationCoordinate2D] {
+            let step = max(1, points.count / 50)
+            return stride(from: 0, to: points.count, by: step).map { points[$0] }
+        }
+        let left = sample(route), right = sample(original)
+        func coverage(_ a: [CLLocationCoordinate2D], _ b: [CLLocationCoordinate2D]) -> Double {
+            Double(a.filter { point in b.contains { metres(point, $0) < 60 } }.count) / Double(a.count)
+        }
+        return coverage(left, right) > 0.85 && coverage(right, left) > 0.85
+    }
+}

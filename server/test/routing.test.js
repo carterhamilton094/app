@@ -161,3 +161,58 @@ test('no-match exception preserves only usable, novel closest options for the fe
     return true;
   });
 });
+
+test('even a legacy six-seed caller cannot exceed two provider requests', async () => {
+  let calls = 0;
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => {
+    calls++;
+    return Response.json({ paths: [{ ...path, ascend: 500 }] });
+  }});
+  await assert.rejects(generate(target, [11, 29, 47, 83, 107, 139]), errorCode('NO_MATCH'));
+  assert.equal(calls, 2);
+});
+test('search stops after one response when it already has two distinct matches', async () => {
+  let calls = 0;
+  const another = { ...path, points: { coordinates: [[0, 0, 10], [.015, .01, 20], [.02, -.015, 10], [0, 0, 10]] } };
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => {
+    calls++; return Response.json({ paths: [path, another] });
+  }});
+  const result = await generate(target, [11, 29, 47]);
+  assert.equal(result.length, 2);
+  assert.equal(calls, 1);
+});
+test('same-athlete in-flight and repeated searches share provider responses', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => {
+    calls++; return Response.json({ paths: [path] });
+  }});
+  await Promise.all([
+    generate(target, [11, 29], [], { cache }),
+    generate(target, [11, 29], [], { cache })
+  ]);
+  assert.equal(calls, 2);
+  await generate(target, [11, 29], [], { cache });
+  assert.equal(calls, 2, 'repeat search makes no extra provider calls');
+  assert.ok([...cache.keys()].every(key => !key.includes('test-only')), 'cache keys never contain API credentials');
+  await generate(target, [11, 29], [], { cache: new Map() });
+  assert.equal(calls, 4, 'another athlete has a separate cache');
+});
+test('radius and effort checks are re-applied to cached paths', async () => {
+  let calls = 0;
+  const cache = new Map();
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => {
+    calls++; return Response.json({ paths: [path] });
+  }});
+  await generate(target, [11], [], { cache });
+  await assert.rejects(generate({ ...target, ascent: 500 }, [11], [], { cache }), errorCode('NO_MATCH'));
+  assert.equal(calls, 1, 'same geometry is reused but is not falsely matched to different climbing');
+  await assert.rejects(generate(target, [11], path.points.coordinates, { cache }), errorCode('NO_MATCH'));
+  assert.equal(calls, 1, 'novelty is checked after cache lookup');
+});
+test('valid first match survives a second request hitting quota', async () => {
+  let calls = 0;
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => ++calls === 1
+    ? Response.json({ paths: [path] }) : Response.json({}, { status: 429 }) });
+  assert.equal((await generate(target, [11, 29])).length, 1);
+});

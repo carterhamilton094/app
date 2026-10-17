@@ -53,7 +53,7 @@ export const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const noteMatch = url.pathname.match(/^\/runs\/(\d+)\/note$/);
     if (req.method !== 'GET' && !(req.method === 'POST' && noteMatch)) return send(res, 405, { error: 'Method not allowed' });
-    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim()), routingMode });
+    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim()), routingMode, routingRequestLimit: 2 });
     if (url.pathname === '/auth/strava') {
       if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !PUBLIC_URL) return send(res, 503, { error: 'Configure Strava on the server first' });
       const write = url.searchParams.get('write') === '1';
@@ -156,14 +156,14 @@ export const server = http.createServer(async (req, res) => {
       // Cache in-flight requests too, so revisiting a card does not spend more quota.
       session.feedBudget.count++;
       session.activeMatches = (session.activeMatches || 0) + 1;
-      const result = generateRoutes(target, [11, 29, 47, 83, 107, 139], workout.run.coordinates)
+      const result = generateRoutes(target, [11, 29], workout.run.coordinates, { cache: session.routeCache ??= new Map() })
         .then(routes => ({ routes: routes.slice(0, 2), suggestions: [], message: null }))
         .catch(error => {
           if (error instanceof NoMatchingRoutesError) return { routes: [], suggestions: error.suggestions, message: error.message };
           session.matches.delete(cacheKey); throw error;
         })
         .finally(() => { session.activeMatches--; });
-      session.matches.set(cacheKey, { result, expires: now + 600000 });
+      session.matches.set(cacheKey, { result, expires: now + 3600000 });
       // Keep per-athlete memory bounded as home settings change.
       if (session.matches.size > 50) session.matches.delete(session.matches.keys().next().value);
       return send(res, 200, await result);
@@ -174,7 +174,7 @@ export const server = http.createServer(async (req, res) => {
       const rate = limits.get(key);
       if (rate && rate.expires > Date.now()) return send(res, 429, { error: 'Please wait one minute before generating more routes' });
       limits.set(key, { expires: Date.now() + 60000 });
-      return send(res, 200, { routes: await generateRoutes(target, [11, 29, 47, 83, 107, 139]) });
+      return send(res, 200, { routes: await generateRoutes(target, [11, 29], [], { cache: session.routeCache ??= new Map() }) });
     }
     send(res, 404, { error: 'Not found' });
   } catch (error) {

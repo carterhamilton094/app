@@ -15,7 +15,9 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
     if (url.pathname === '/oauth/token') return Response.json({ access_token: 'mock-access', refresh_token: 'mock-refresh', expires_at: Math.floor(Date.now() / 1000) + 3600 });
     if (url.pathname === '/api/v3/athlete/activities') return Response.json([
       { id: 42, name: 'Test run', sport_type: 'Run', distance: 8000, total_elevation_gain: 100,
-        moving_time: 2400, start_date: '2026-10-17T00:00:00Z', map: { summary_polyline: '_p~iF~ps|U_ulLnnqC' } }
+        moving_time: 2400, start_date: '2026-10-17T00:00:00Z', map: { summary_polyline: '_p~iF~ps|U_ulLnnqC' } },
+      { id: 43, name: 'Another workout', sport_type: 'Run', distance: 9000, total_elevation_gain: 100,
+        moving_time: 2700, start_date: '2026-10-16T00:00:00Z', map: { summary_polyline: '_p~iF~ps|U_ulLnnqC' } }
     ]);
     if (url.hostname === 'graphhopper.com') {
       routingCalls++;
@@ -60,16 +62,20 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
   assert.equal(body.routes.length, 2);
   assert.equal(body.routes[0].distance, 8000);
   assert.equal(body.routes[0].coordinates.length, 4);
-  assert.equal(routingCalls, 6);
+  assert.equal(routingCalls, 2);
   const cached = await nativeFetch(path, { headers });
   assert.deepEqual(await cached.json(), body);
-  assert.equal(routingCalls, 6, 'repeat feed loads reuse cached routes');
+  assert.equal(routingCalls, 2, 'repeat feed loads reuse cached routes');
+  const plan = await nativeFetch(`${base}/routes?lat=0&lon=0&radius=5000&distance=8000&ascent=100`, { headers });
+  assert.equal(plan.status, 200);
+  assert.equal((await plan.json()).routes.length, 2);
+  assert.equal(routingCalls, 2, 'Plan reuses the same athlete’s feed provider responses');
   const missing = await nativeFetch(`${base}/runs/999/alternatives?lat=0&lon=0&radius=5000`, { headers });
   assert.equal(missing.status, 404, 'only this athlete’s activities may be matched');
   const invalid = await nativeFetch(`${base}/runs/42/alternatives?lat=0&lon=0&radius=-1`, { headers });
   assert.equal(invalid.status, 400);
   tooHilly = true;
-  const noMatch = await nativeFetch(`${base}/runs/42/alternatives?lat=0&lon=0&radius=6000`, { headers });
+  const noMatch = await nativeFetch(`${base}/runs/43/alternatives?lat=0&lon=0&radius=6000`, { headers });
   assert.equal(noMatch.status, 200);
   const failure = await noMatch.json();
   assert.equal(failure.routes.length, 0, 'hilly options are never reported as matched');
@@ -79,7 +85,7 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
   assert.match(failure.message, /Distance-matched routes climbed 500–500 m/);
   assert.match(failure.message, /target is 100 m/);
   const callsBeforeReveal = routingCalls;
-  const cachedClosest = await nativeFetch(`${base}/runs/42/alternatives?lat=0&lon=0&radius=6000`, { headers });
+  const cachedClosest = await nativeFetch(`${base}/runs/43/alternatives?lat=0&lon=0&radius=6000`, { headers });
   assert.deepEqual(await cachedClosest.json(), failure);
   assert.equal(routingCalls, callsBeforeReveal, 'closest options reuse the existing search, without extra routing calls');
 });

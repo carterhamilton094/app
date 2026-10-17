@@ -15,6 +15,7 @@ struct Dashboard: View {
     @State private var runs: [Run] = SessionStore.read() == nil ? demoRuns : []
     @State private var routes: [Route] = []
     @State private var selected: Route?
+    @State private var planFromLibrary = false
     @State private var target = 8.0
     @State private var climb = 100.0
     @AppStorage("homeRadius") private var radius = 5.0
@@ -85,7 +86,7 @@ struct Dashboard: View {
             NavigationStack { settingsView }
                 .tabItem { Label("Settings", systemImage: "gearshape.fill") }.tag(3)
         }
-        .onChange(of: radius) { _, _ in resetFeedMatches(); routes = []; selected = nil }
+        .onChange(of: radius) { _, _ in resetFeedMatches(); routes = []; selected = nil; planFromLibrary = false }
         .preferredColorScheme(.dark).tint(accent)
         .sheet(item: $detail, onDismiss: { detailClimbingTarget = nil }) { route in
             RouteDetails(
@@ -131,7 +132,7 @@ struct Dashboard: View {
                             .font(.caption)
                     }
                 }
-                Text("Alternatives are searched near your saved home, not the original run’s starting point.")
+                Text("Saved alternatives are matched locally near home. New routes are generated only when you tap Find new alternatives.")
                     .font(.caption).foregroundStyle(.secondary)
                 if let message { Text(message).font(.callout).foregroundStyle(.orange) }
                 if runs.isEmpty {
@@ -140,7 +141,6 @@ struct Dashboard: View {
                 }
                 ForEach(runs) { run in
                     feedCard(run)
-                        .task(id: feedContext) { await loadAlternatives(for: run, context: feedContext) }
                 }
                 Text("Matches compare distance (70%) and climbing (30%). Terrain and conditions affect effort. Always review a route before running.")
                     .font(.caption).foregroundStyle(.secondary)
@@ -151,7 +151,10 @@ struct Dashboard: View {
     }
     private func feedCard(_ run: Run) -> some View {
         let isClosest = showingClosest.contains(run.id) && !showingDemo
-        let matches = showingDemo ? demoAlternatives(for: run) : (isClosest ? closestOptions[run.id] ?? [] : alternatives[run.id] ?? [])
+        let savedMatches = matchingSavedRoutes(for: run)
+        let strictMatches = mergeRoutes(alternatives[run.id] ?? [], savedMatches)
+        let matches = showingDemo ? demoAlternatives(for: run) : (isClosest ? closestOptions[run.id] ?? [] : strictMatches)
+        let hasSavedMatches = !savedMatches.isEmpty && (alternatives[run.id] ?? []).isEmpty && !isClosest && !showingDemo
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 Image(systemName: "figure.run").foregroundStyle(accent).padding(.top, 3)
@@ -186,6 +189,10 @@ struct Dashboard: View {
                     }
                 }
             }
+            if hasSavedMatches {
+                Label("From your saved routes", systemImage: "bookmark.fill")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
             if let options = closestOptions[run.id], !options.isEmpty, !showingDemo {
                 Button(isClosest ? "Hide closest options" : "Show closest options · climbing differs") {
                     if isClosest { showingClosest.remove(run.id) }
@@ -194,20 +201,24 @@ struct Dashboard: View {
             }
             if let error = alternativeErrors[run.id], !showingDemo {
                 Text(error).font(.caption).foregroundStyle(.secondary)
-                if hasHome && !loadingAlternatives.contains(run.id) {
-                    Button("Retry alternatives") {
-                        alternativeErrors[run.id] = nil
-                        alternatives[run.id] = nil
-                        closestOptions[run.id] = nil
-                        showingClosest.remove(run.id)
-                        Task { await loadAlternatives(for: run, context: feedContext) }
-                    }.font(.caption)
+            }
+            if !showingDemo {
+                Button {
+                    alternativeErrors[run.id] = nil
+                    alternatives[run.id] = nil
+                    closestOptions[run.id] = nil
+                    showingClosest.remove(run.id)
+                    Task { await loadAlternatives(for: run, context: feedContext) }
+                } label: {
+                    Text(loadingAlternatives.contains(run.id) ? "Searching…" : "Find new alternatives · up to 2 routing requests")
                 }
+                .font(.caption.bold())
+                .disabled(!hasHome || account?.routingConfigured != true || loadingAlternatives.contains(run.id))
             }
             Button("Use this effort in Plan") {
                 target = min(30, max(2, run.km))
                 climb = min(800, max(0, run.total_elevation_gain))
-                routes = []; selected = nil; activeTab = 1
+                routes = []; selected = nil; planFromLibrary = false; activeTab = 1
             }.font(.caption.bold())
         }
         .padding(16).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 24))
@@ -245,7 +256,7 @@ struct Dashboard: View {
         else if account?.routingConfigured == false { text = "Discovery unavailable" }
         else if loadingAlternatives.contains(run.id) { text = "Finding a match…" }
         else if count > 0 { text = "No second match found" }
-        else { text = "No match available" }
+        else { text = "No saved match yet" }
         return VStack(alignment: .leading, spacing: 7) {
             RoundedRectangle(cornerRadius: 14).fill(.white.opacity(0.04))
                 .frame(height: 105)
@@ -258,12 +269,24 @@ struct Dashboard: View {
             Text("Alternative \(index + 1)").font(.caption).foregroundStyle(.secondary)
         }.frame(maxWidth: .infinity, alignment: .leading)
     }
+    private func matchingSavedRoutes(for run: Run) -> [Route] {
+        guard !showingDemo, hasHome else { return [] }
+        return Array(SavedRouteMatcher.matches(savedRoutes, distance: run.distance, ascent: run.total_elevation_gain,
+                                               home: home, radius: radius * 1000, excluding: run).prefix(2))
+    }
+    private func mergeRoutes(_ saved: [Route], _ recent: [Route]) -> [Route] {
+        var result: [Route] = []
+        for route in saved + recent {
+            if !result.contains(where: { RouteLibrary.sameGeometry($0, route) }) { result.append(route) }
+        }
+        return Array(result.prefix(2))
+    }
     private func loadAlternatives(for run: Run, context: String) async {
         guard !showingDemo, !token.isEmpty, hasHome, account?.routingConfigured == true, let api,
               alternatives[run.id] == nil, alternativeErrors[run.id] == nil,
               !loadingAlternatives.contains(run.id) else { return }
         guard (2000...30000).contains(run.distance), (0...800).contains(run.total_elevation_gain) else {
-            alternativeErrors[run.id] = "Automatic matches currently support runs from 2–30 km with up to 800 m climbing."
+            alternativeErrors[run.id] = "New route searches currently support runs from 2–30 km with up to 800 m climbing."
             return
         }
         loadingAlternatives.insert(run.id)
@@ -305,8 +328,17 @@ struct Dashboard: View {
                                 .font(.caption).foregroundStyle(.secondary)
                         }
                         Button { Task { await findRoutes() } } label: {
-                            HStack { Spacer(); if busy { ProgressView().tint(.black) }; Text(busy ? "Finding your loops…" : "Find a different route").bold(); Image(systemName: "arrow.up.right"); Spacer() }.padding()
+                            HStack { Spacer(); if busy { ProgressView().tint(.black) }; Text(busy ? "Finding your loops…" : "Find routes · saved first").bold(); Image(systemName: "arrow.up.right"); Spacer() }.padding()
                         }.background(accent, in: RoundedRectangle(cornerRadius: 16)).foregroundStyle(.black).disabled(busy)
+                        Button("Generate fresh options · up to 2 routing requests") {
+                            Task { await findRoutes(fresh: true) }
+                        }.font(.caption.bold()).disabled(busy)
+                        if planFromLibrary {
+                            Label("From your saved routes · no new routing requests", systemImage: "bookmark.fill")
+                                .font(.caption).foregroundStyle(.secondary)
+                        }
+                        Text("A smaller fresh search may find fewer matches. Saved routes are checked first unless you explicitly request fresh options.")
+                            .font(.caption).foregroundStyle(.secondary)
                     }.padding(20).background(.white.opacity(0.05), in: RoundedRectangle(cornerRadius: 24))
                     if let message { Text(message).font(.callout).foregroundStyle(.orange).textSelection(.enabled) }
                     if !routes.isEmpty {
@@ -323,8 +355,8 @@ struct Dashboard: View {
                         }
                     }
         }
-        .onChange(of: target) { _, _ in routes = []; selected = nil }
-        .onChange(of: climb) { _, _ in routes = []; selected = nil }
+        .onChange(of: target) { _, _ in routes = []; selected = nil; planFromLibrary = false }
+        .onChange(of: climb) { _, _ in routes = []; selected = nil; planFromLibrary = false }
     }
     private var trend: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -374,7 +406,7 @@ struct Dashboard: View {
             Section("Home & route radius") {
                         slider("Home radius", value: $radius, range: 1...20, suffix: "km")
                         Button { pickingHome.toggle() } label: { Label(pickingHome ? "Tap the map to place home" : "Choose home on map", systemImage: "house") }
-                        Text("The initial map is an example location in Brisbane. Set your home before searching. When connected and route discovery is available, Home searches automatically inside this radius. The routing provider then receives the start point.").font(.caption).foregroundStyle(.secondary)
+                        Text("The initial map is an example location in Brisbane. Set your home before searching. Home checks saved routes inside this radius without a routing request. The routing provider receives the start point only when you choose to generate fresh routes.").font(.caption).foregroundStyle(.secondary)
                         MapReader { proxy in
                             Map(position: $camera) {
                                 Annotation("Home", coordinate: home) { Image(systemName: "house.fill").padding(10).background(accent, in: Circle()).foregroundStyle(.black) }
@@ -383,7 +415,7 @@ struct Dashboard: View {
                             }
                             .onTapGesture { point in
                                 if pickingHome, let coordinate = proxy.convert(point, from: .local) {
-                                    home = coordinate; routes = []; selected = nil; pickingHome = false
+                                    home = coordinate; routes = []; selected = nil; planFromLibrary = false; pickingHome = false
                                     UserDefaults.standard.set(home.latitude, forKey: "homeLat")
                                     UserDefaults.standard.set(home.longitude, forKey: "homeLon")
                                     resetFeedMatches()
@@ -571,7 +603,17 @@ struct Dashboard: View {
         do { let _: Session = try await api.get("disconnect"); token = ""; SessionStore.save(nil); runs = demoRuns; showingDemo = true; account = nil; savedRoutes = []; olderRuns = []; historyBefore = nil; historyFinished = false; resetFeedMatches(); rebuildHeat(); message = nil }
         catch { message = error.localizedDescription }
     }
-    private func findRoutes() async {
+    private func findRoutes(fresh: Bool = false) async {
+        if !fresh && !showingDemo && hasHome {
+            let reused = SavedRouteMatcher.matches(savedRoutes, distance: target * 1000, ascent: climb,
+                                                   home: home, radius: radius * 1000)
+            if !reused.isEmpty {
+                routes = Array(reused.prefix(2)); selected = routes.first; planFromLibrary = true
+                message = "Found matching routes in your saved library. No new routing requests were made."
+                return
+            }
+        }
+        planFromLibrary = false
         guard hasHome else { message = "Choose your home in Settings before finding routes."; return }
         guard let api, !token.isEmpty else { message = "Connect Strava in Connections to generate live routes. Demo history is for exploring the interface."; return }
         busy = true; message = nil

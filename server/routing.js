@@ -71,12 +71,53 @@ export function waypointLoop(target, seed) {
   return [[target.lat, target.lon], destination(bearing), destination(bearing + Math.PI / 3), [target.lat, target.lon]];
 }
 export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' }) {
-  return async function generateRoutes(target, seeds, original = []) {
+  async function readPaths(endpoint, target) {
+    let response;
+    try {
+      response = await fetcher(endpoint, { signal: AbortSignal.timeout(20000) });
+    } catch (error) {
+      throw new RoutingError(['TimeoutError', 'AbortError'].includes(error.name) ? 'TIMEOUT' : 'UNAVAILABLE');
+    }
+    if ([401, 403].includes(response.status)) throw new RoutingError('ACCESS');
+    if (response.status === 429) throw new RoutingError('QUOTA');
+    if (response.status >= 500) throw new RoutingError('UNAVAILABLE');
+    let result;
+    try { result = await response.json(); }
+    catch { throw new RoutingError('INVALID_RESPONSE'); }
+    if (!response.ok) {
+      // Inspect upstream diagnostics to distinguish an unroutable point, but never
+      // echo provider text: it can contain key-bearing URLs and private locations.
+      const hints = Array.isArray(result?.hints) ? result.hints : [];
+      const diagnostic = [result?.message, ...hints.map(h => `${h.details ?? ''} ${h.message ?? ''}`)].join(' ');
+      if (/invalid.*(?:api.?key|key)|(?:api.?key|key).*invalid|not authorized/i.test(diagnostic)) throw new RoutingError('ACCESS');
+      const noPath = /PointNotFoundException|ConnectionNotFoundException|cannot find point|cannot find.*route|connection between locations not found/i.test(diagnostic);
+      if (response.status === 400 && noPath) return [];
+      throw new RoutingError('REJECTED', safeProviderDetail(result, key, target));
+    }
+    if (!Array.isArray(result?.paths)) throw new RoutingError('INVALID_RESPONSE');
+    const valid = result.paths.filter(validPath);
+    if (result.paths.length && !valid.length) throw new RoutingError('INVALID_RESPONSE');
+    return valid;
+  }
+  async function requestPaths(endpoint, target, cache) {
+    if (!cache) return readPaths(endpoint, target);
+    const query = new URLSearchParams(endpoint.searchParams);
+    query.delete('key');
+    const cacheKey = query.toString();
+    const cached = cache.get(cacheKey);
+    if (cached && cached.expires > Date.now()) return cached.result;
+    // This cache belongs to one athlete/session. It never stores an API key.
+    const result = readPaths(endpoint, target).catch(error => { cache.delete(cacheKey); throw error; });
+    cache.set(cacheKey, { result, expires: Date.now() + 3600000 });
+    if (cache.size > 64) cache.delete(cache.keys().next().value);
+    return result;
+  }
+  return async function generateRoutes(target, seeds, original = [], { cache } = {}) {
     if (!key?.trim()) throw new RoutingError('NOT_CONFIGURED');
     if (!['waypoints', 'round_trip'].includes(mode)) throw new RoutingError('MODE');
     const paths = [];
     let distanceScale = 1;
-    for (const seed of seeds) {
+    for (const seed of seeds.slice(0, 2)) {
       const endpoint = new URL('https://graphhopper.com/api/1/route');
       const query = new URLSearchParams({ key, profile: 'foot', elevation: 'true', points_encoded: 'false', instructions: 'false' });
       if (mode === 'round_trip') {
@@ -90,31 +131,14 @@ export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' 
         for (const [lat, lon] of waypointLoop({ ...target, distance: target.distance * distanceScale }, seed)) query.append('point', `${lat},${lon}`);
       }
       endpoint.search = query;
-      let response;
+      let valid;
       try {
-        response = await fetcher(endpoint, { signal: AbortSignal.timeout(20000) });
+        valid = await requestPaths(endpoint, target, cache);
       } catch (error) {
-        throw new RoutingError(['TimeoutError', 'AbortError'].includes(error.name) ? 'TIMEOUT' : 'UNAVAILABLE');
+        const available = selectRoutes(paths.filter(path => !retraces(path.coordinates, original)), target);
+        if (available.length && ['ROUTING_QUOTA', 'ROUTING_TIMEOUT', 'ROUTING_UNAVAILABLE'].includes(error.code)) return available.slice(0, 2);
+        throw error;
       }
-      if ([401, 403].includes(response.status)) throw new RoutingError('ACCESS');
-      if (response.status === 429) throw new RoutingError('QUOTA');
-      if (response.status >= 500) throw new RoutingError('UNAVAILABLE');
-      let result;
-      try { result = await response.json(); }
-      catch { throw new RoutingError('INVALID_RESPONSE'); }
-      if (!response.ok) {
-        // Inspect upstream diagnostics to distinguish an unroutable point, but never
-        // echo provider text: it can contain key-bearing URLs and private locations.
-        const hints = Array.isArray(result?.hints) ? result.hints : [];
-        const diagnostic = [result?.message, ...hints.map(h => `${h.details ?? ''} ${h.message ?? ''}`)].join(' ');
-        if (/invalid.*(?:api.?key|key)|(?:api.?key|key).*invalid|not authorized/i.test(diagnostic)) throw new RoutingError('ACCESS');
-        const noPath = /PointNotFoundException|ConnectionNotFoundException|cannot find point|cannot find.*route|connection between locations not found/i.test(diagnostic);
-        if (response.status === 400 && noPath) continue;
-        throw new RoutingError('REJECTED', safeProviderDetail(result, key, target));
-      }
-      if (!Array.isArray(result?.paths)) throw new RoutingError('INVALID_RESPONSE');
-      const valid = result.paths.filter(validPath);
-      if (result.paths.length && !valid.length) throw new RoutingError('INVALID_RESPONSE');
       if (mode === 'waypoints' && valid.length) {
         const nearest = valid.reduce((best, path) => Math.abs(path.distance - target.distance) < Math.abs(best.distance - target.distance) ? path : best);
         if (Math.abs(nearest.distance - target.distance) / target.distance > .2) {
@@ -126,10 +150,12 @@ export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' 
         paths.push({ id: `${seed}-${index}`, name: `Discovery loop ${paths.length + 1}`,
           distance: path.distance, ascent: path.ascend, coordinates: path.points.coordinates });
       }
+      const ready = selectRoutes(paths.filter(path => !retraces(path.coordinates, original)), target);
+      if (ready.length >= 2) return ready.slice(0, 2);
     }
     const distinct = paths.filter(path => !retraces(path.coordinates, original));
     const matches = selectRoutes(distinct, target);
     if (!matches.length) throw new NoMatchingRoutesError(paths, target, original);
-    return matches;
+    return matches.slice(0, 2);
   };
 }
