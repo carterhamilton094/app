@@ -47,7 +47,7 @@ Set environment variables in Render; never commit credentials or paste them into
 - `STRAVA_CLIENT_ID`: your Strava API application ID.
 - `STRAVA_CLIENT_SECRET`: the current secret for that application.
 - `PUBLIC_URL=https://runways.onrender.com` for this deployment.
-- `GRAPHHOPPER_KEY`: a GraphHopper Directions API key supporting foot routing, elevation and round-trip routing. This is required to discover new routes, but not to sync Strava history or show its heat map. Sign up at https://www.graphhopper.com/ and enter the key directly in Render. Save and redeploy. Check `/health` reports `routingConfigured:true`, then refresh Strava in Settings so the app sees the updated capability. A nonempty key is only a configuration check; actual provider validity/quota is established by generating routes.
+- `GRAPHHOPPER_KEY`: a GraphHopper Directions API key supporting foot routing, elevation and round-trip routing. This is required to discover new routes, but not to sync Strava history or show its heat map. Sign up at https://www.graphhopper.com/ and enter the key directly in Render. Save and redeploy. Check `/health` reports `routingConfigured:true`, then refresh Strava in Settings so the app sees the updated capability. The backend uses flexible mode (`ch.disable=true`) for round trips and requests unencoded coordinates with elevation. A nonempty key is only a configuration check; actual provider validity/quota is established by generating routes.
 
 Strava **Authorization Callback Domain** must be `runways.onrender.com` (hostname only). The backend callback is `/auth/callback` and returns to the app's `runways` scheme. Initial connection requests `read,activity:read_all`. Optional note permission requests an additional `activity:write` with a fresh authorization screen. Declining write access leaves read-only use available.
 
@@ -91,6 +91,8 @@ Automatic matching supports runs of 2–30 km and up to 800 m climbing. Zero or 
 Strava tokens stay on the backend; the device stores its opaque session in Keychain. Home and route radius are stored locally. Discoveries and completion links are stored locally per athlete and remain available after reconnecting the same account; they are not a cross-device backup. Completed history is reloaded from Strava. Disconnect revokes Strava access and clears visible account data but retains that account's local saved-route library.
 
 ## Validation and release limitations
+
+Routing errors distinguish missing configuration, provider authentication/access failures, quota exhaustion, timeouts, unavailable services, unsupported requests and incomplete elevation/geometry. Provider messages and key-bearing URLs are never returned to the phone. If a seed has no routable point, later candidates are still attempted; an area with no suitable routes returns an empty match list.
 
 Run `cd server && npm test`. These tests use mocked providers and real local HTTP to exercise authentication, maps, matching, history pagination, write permission, activity ownership, note preservation and idempotency. They do not use real credentials or modify live Strava activities.
 

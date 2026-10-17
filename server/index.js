@@ -1,10 +1,12 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
-import { parseTarget, selectRoutes, retraces } from './routes.js';
+import { parseTarget } from './routes.js';
+import { createRoutingService, RoutingError } from './routing.js';
 import { runningActivities, targetForRun, appendRouteNote, historyPage } from './activities.js';
 const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY } = process.env;
 const port = Number(process.env.PORT || 3000);
 const upstreamFetch = fetch;
+const generateRoutes = createRoutingService({ key: GRAPHHOPPER_KEY, fetcher: upstreamFetch });
 // Development storage only. Restarting the server requires reconnecting Strava.
 const states = new Map(), tickets = new Map(), sessions = new Map(), limits = new Map();
 const opaque = () => randomBytes(32).toString('hex');
@@ -42,19 +44,6 @@ async function athleteRuns(session) {
   }
   return session.loadingRuns;
 }
-async function generateRoutes(target, seeds, original = []) {
-  const paths = [];
-  for (const seed of seeds) {
-    const endpoint = new URL('https://graphhopper.com/api/1/route');
-    endpoint.search = new URLSearchParams({ key: GRAPHHOPPER_KEY, point: `${target.lat},${target.lon}`, profile: 'foot', algorithm: 'round_trip', 'round_trip.distance': String(target.distance), 'round_trip.seed': String(seed), elevation: 'true', points_encoded: 'false' });
-    const result = await json(endpoint);
-    for (const [index, p] of (result.paths || []).entries()) {
-      paths.push({ id: `${seed}-${index}`, name: `Discovery loop ${paths.length + 1}`, distance: p.distance, ascent: p.ascend, coordinates: p.points?.coordinates });
-    }
-  }
-  const distinct = paths.filter(p => !retraces(p.coordinates, original));
-  return selectRoutes(distinct, target);
-}
 setInterval(() => {
   for (const map of [states, tickets, sessions, limits]) for (const [key, value] of map) if (value.expires < Date.now()) map.delete(key);
 }, 60000).unref();
@@ -63,7 +52,7 @@ export const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const noteMatch = url.pathname.match(/^\/runs\/(\d+)\/note$/);
     if (req.method !== 'GET' && !(req.method === 'POST' && noteMatch)) return send(res, 405, { error: 'Method not allowed' });
-    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY) });
+    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim()) });
     if (url.pathname === '/auth/strava') {
       if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !PUBLIC_URL) return send(res, 503, { error: 'Configure Strava on the server first' });
       const write = url.searchParams.get('write') === '1';
@@ -96,7 +85,7 @@ export const server = http.createServer(async (req, res) => {
       return send(res, 200, {
         athleteID: session.tokens.athlete?.id ?? session.athleteID,
         writeAuthorized: session.scopes?.includes('activity:write') ?? false,
-        routingConfigured: Boolean(GRAPHHOPPER_KEY)
+        routingConfigured: Boolean(GRAPHHOPPER_KEY?.trim())
       });
     }
     if (url.pathname === '/history') {
@@ -148,7 +137,7 @@ export const server = http.createServer(async (req, res) => {
     }
     const match = url.pathname.match(/^\/runs\/(\d+)\/alternatives$/);
     if (match) {
-      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Route discovery is not available yet. Your Strava runs and maps still work.' });
+      if (!GRAPHHOPPER_KEY?.trim()) throw new RoutingError('NOT_CONFIGURED');
       const workout = targetForRun(await athleteRuns(session), match[1], url.searchParams);
       if (!workout) return send(res, 404, { error: 'Run not found in your recent Strava activities' });
       let target;
@@ -176,7 +165,7 @@ export const server = http.createServer(async (req, res) => {
       return send(res, 200, { routes: await result });
     }
     if (url.pathname === '/routes') {
-      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Route discovery is not available yet. Your Strava runs and maps still work.' });
+      if (!GRAPHHOPPER_KEY?.trim()) throw new RoutingError('NOT_CONFIGURED');
       let target; try { target = parseTarget(url.searchParams); } catch (e) { return send(res, 400, { error: e.message }); }
       const rate = limits.get(key);
       if (rate && rate.expires > Date.now()) return send(res, 429, { error: 'Please wait one minute before generating more routes' });
@@ -184,5 +173,8 @@ export const server = http.createServer(async (req, res) => {
       return send(res, 200, { routes: await generateRoutes(target, [11, 29, 47, 83, 107, 139]) });
     }
     send(res, 404, { error: 'Not found' });
-  } catch { send(res, 502, { error: 'The upstream service could not complete this request. Check server credentials, provider quota and connectivity.' }); }
+  } catch (error) {
+    if (error instanceof RoutingError) return send(res, error.status, { error: error.message, code: error.code });
+    send(res, 502, { error: 'The upstream service could not complete this request. Check server credentials, provider quota and connectivity.' });
+  }
 }).listen(port, '0.0.0.0', () => console.log(`Runways backend listening on ${port}`));
