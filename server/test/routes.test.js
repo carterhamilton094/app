@@ -19,3 +19,18 @@ test('requires finite parameters and accepts zero elevation', () => {
   assert.equal(parseTarget(query).ascent, 0);
   query.set('radius', 'Infinity'); assert.throws(() => parseTarget(query));
 });
+
+test('no-match explanations distinguish radius, distance, climbing and retraced routes', async () => {
+  const { noMatchMessage } = await import('../routes.js');
+  const outside = { ...route, coordinates: [[0, 0], [1, 1], [0, 0]] };
+  assert.match(noMatchMessage([outside], target), /left your 5.0 km home radius/);
+  assert.match(noMatchMessage([{ ...route, distance: 4000 }], target), /4.0–4.0 km.*target is 8.0 km/);
+  assert.match(noMatchMessage([{ ...route, ascent: 250 }], target), /climbed 250–250 m.*target is 100 m/);
+  assert.match(noMatchMessage([route], target, route.coordinates), /retraced your recorded run/);
+  assert.match(noMatchMessage([], target), /No walkable loop/);
+});
+test('every filter is reported when a candidate fails multiple matching rules', async () => {
+  const { routeRejections } = await import('../routes.js');
+  const bad = { ...route, distance: 20000, ascent: 500, coordinates: [[0, 0], [1, 1], [1, 1]] };
+  assert.deepEqual(routeRejections(bad, target), ['radius', 'closure', 'distance', 'climb']);
+});

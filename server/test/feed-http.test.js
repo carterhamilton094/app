@@ -9,6 +9,7 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
     PUBLIC_URL: 'https://runways.test', GRAPHHOPPER_KEY: 'test-only'
   });
   let routingCalls = 0;
+  let tooHilly = false;
   globalThis.fetch = async (input) => {
     const url = new URL(input);
     if (url.pathname === '/oauth/token') return Response.json({ access_token: 'mock-access', refresh_token: 'mock-refresh', expires_at: Math.floor(Date.now() / 1000) + 3600 });
@@ -23,7 +24,7 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
       assert.equal(url.searchParams.getAll('point').length, 4);
       assert.equal(url.searchParams.get('point'), '0,0');
       const shift = routingCalls * .001;
-      return Response.json({ paths: [{ distance: 8000, ascend: 100,
+      return Response.json({ paths: [{ distance: 8000, ascend: tooHilly ? 500 : 100,
         points: { coordinates: [[0, 0], [.01 + shift, .01], [.015, -.01 - shift], [0, 0]] } }] });
     }
     throw new Error('Unexpected upstream request');
@@ -67,4 +68,11 @@ test('authenticated feed returns map geometry and two cached workout-matched alt
   assert.equal(missing.status, 404, 'only this athlete’s activities may be matched');
   const invalid = await nativeFetch(`${base}/runs/42/alternatives?lat=0&lon=0&radius=-1`, { headers });
   assert.equal(invalid.status, 400);
+  tooHilly = true;
+  const noMatch = await nativeFetch(`${base}/runs/42/alternatives?lat=0&lon=0&radius=6000`, { headers });
+  assert.equal(noMatch.status, 422);
+  const failure = await noMatch.json();
+  assert.equal(failure.code, 'ROUTING_NO_MATCH');
+  assert.match(failure.error, /Distance-matched routes climbed 500–500 m/);
+  assert.match(failure.error, /target is 100 m/);
 });

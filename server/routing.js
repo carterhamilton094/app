@@ -1,6 +1,7 @@
-import { selectRoutes, retraces } from './routes.js';
+import { selectRoutes, retraces, noMatchMessage } from './routes.js';
 
 const failures = {
+  NO_MATCH: [422, 'No matching routes found.'],
   MODE: [503, 'The route service has an invalid routing mode. Use waypoints or round_trip in Render.'],
   NOT_CONFIGURED: [503, 'Route discovery is not available yet. Your Strava runs and maps still work.'],
   ACCESS: [503, 'The route service could not authenticate. Check the GraphHopper key and its routing access in Render.'],
@@ -16,6 +17,12 @@ export class RoutingError extends Error {
     super(detail ? `${message} GraphHopper: ${detail}` : message);
     this.status = status;
     this.code = `ROUTING_${reason}`;
+  }
+}
+export class NoMatchingRoutesError extends RoutingError {
+  constructor(paths, target, original) {
+    super('NO_MATCH');
+    this.message = noMatchMessage(paths, target, original);
   }
 }
 // Surface provider diagnostics without leaking query URLs, API keys or home coordinates.
@@ -66,6 +73,7 @@ export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' 
     if (!key?.trim()) throw new RoutingError('NOT_CONFIGURED');
     if (!['waypoints', 'round_trip'].includes(mode)) throw new RoutingError('MODE');
     const paths = [];
+    let distanceScale = 1;
     for (const seed of seeds) {
       const endpoint = new URL('https://graphhopper.com/api/1/route');
       const query = new URLSearchParams({ key, profile: 'foot', elevation: 'true', points_encoded: 'false', instructions: 'false' });
@@ -77,7 +85,7 @@ export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' 
         query.set('round_trip.seed', String(seed));
         query.set('ch.disable', 'true');
       } else {
-        for (const [lat, lon] of waypointLoop(target, seed)) query.append('point', `${lat},${lon}`);
+        for (const [lat, lon] of waypointLoop({ ...target, distance: target.distance * distanceScale }, seed)) query.append('point', `${lat},${lon}`);
       }
       endpoint.search = query;
       let response;
@@ -105,12 +113,21 @@ export function createRoutingService({ key, fetcher = fetch, mode = 'waypoints' 
       if (!Array.isArray(result?.paths)) throw new RoutingError('INVALID_RESPONSE');
       const valid = result.paths.filter(validPath);
       if (result.paths.length && !valid.length) throw new RoutingError('INVALID_RESPONSE');
+      if (mode === 'waypoints' && valid.length) {
+        const nearest = valid.reduce((best, path) => Math.abs(path.distance - target.distance) < Math.abs(best.distance - target.distance) ? path : best);
+        if (Math.abs(nearest.distance - target.distance) / target.distance > .2) {
+          // Learn the road-network detour factor using the same fixed request budget.
+          distanceScale = Math.max(.5, Math.min(1.8, distanceScale * target.distance / nearest.distance));
+        }
+      }
       for (const [index, path] of valid.entries()) {
         paths.push({ id: `${seed}-${index}`, name: `Discovery loop ${paths.length + 1}`,
           distance: path.distance, ascent: path.ascend, coordinates: path.points.coordinates });
       }
     }
     const distinct = paths.filter(path => !retraces(path.coordinates, original));
-    return selectRoutes(distinct, target);
+    const matches = selectRoutes(distinct, target);
+    if (!matches.length) throw new NoMatchingRoutesError(paths, target, original);
+    return matches;
   };
 }

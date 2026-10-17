@@ -51,7 +51,7 @@ test('no routable point for one seed does not discard a later viable loop', asyn
 });
 test('an unroutable area returns no matches rather than fabricated geometry', async () => {
   const generate = createRoutingService({ key: 'test-only', fetcher: async () => Response.json({ message: 'Cannot find point 0' }, { status: 400 }) });
-  assert.deepEqual(await generate(target, [11, 29]), []);
+  await assert.rejects(generate(target, [11, 29]), errorCode('NO_MATCH'));
 });
 test('missing elevation or malformed geometry is rejected', async () => {
   const invalid = [
@@ -126,10 +126,23 @@ test('standard searches still reject real paths outside radius or mismatching wo
   const tooHilly = { ...path, ascend: 500 };
   for (const invalid of [outside, tooLong, tooHilly]) {
     const generate = createRoutingService({ key: 'test-only', fetcher: async () => Response.json({ paths: [invalid] }) });
-    assert.deepEqual(await generate(target, [11]), []);
+    await assert.rejects(generate(target, [11]), errorCode('NO_MATCH'));
   }
 });
 test('invalid routing mode fails before spending provider credits', async () => {
   const generate = createRoutingService({ key: 'test-only', mode: 'unknown', fetcher: () => { throw new Error('Must not run'); } });
   await assert.rejects(generate(target, [11]), errorCode('MODE'));
+});
+
+test('later standard searches calibrate waypoint size from the observed route length', async () => {
+  const anchors = [];
+  const generate = createRoutingService({ key: 'test-only', fetcher: async url => {
+    const [lat, lon] = url.searchParams.getAll('point')[1].split(',').map(Number);
+    anchors.push(meters([0, 0], [lon, lat]));
+    return Response.json({ paths: [{ ...path, distance: anchors.length === 1 ? 4000 : 8000 }] });
+  }});
+  const routes = await generate(target, [11, 29]);
+  assert.equal(routes[0].distance, 8000);
+  assert.ok(anchors[1] > anchors[0] * 1.5, 'short first path enlarges subsequent search anchors');
+  assert.equal(anchors.length, 2, 'does not add extra quota-consuming requests');
 });
