@@ -67,3 +67,30 @@ test('timeouts, service failures and rejected profile settings have clear outcom
     await assert.rejects(generate(target, [11]), errorCode(code));
   }
 });
+
+test('rejected requests return helpful provider details with keys, URLs and location removed', async () => {
+  const key = 'private-key-for-testing';
+  const localTarget = { ...target, lat: -27.4698, lon: 153.0251 };
+  const generate = createRoutingService({ key, fetcher: async () => Response.json({
+    message: `Unsupported parameter ch.disable for https://graphhopper.com/api/1/route?key=${key}&point=-27.4698,153.0251`,
+    hints: [{ message: `Foot profile is unavailable; point=-27.4698,153.0251; api_key=${key}` }]
+  }, { status: 400 }) });
+  await assert.rejects(generate(localTarget, [11]), error => {
+    assert.equal(error.code, 'ROUTING_REJECTED');
+    assert.match(error.message, /Unsupported parameter ch.disable/);
+    assert.match(error.message, /Foot profile is unavailable/);
+    for (const privateValue of [key, 'https://graphhopper.com', '-27.4698', '153.0251']) {
+      assert.equal(error.message.includes(privateValue), false, `Must not expose ${privateValue}`);
+    }
+    return true;
+  });
+});
+test('provider diagnostic sanitization also handles encoded keys and control characters', async () => {
+  const { safeProviderDetail } = await import('../routing.js');
+  const key = 'private/key+value';
+  const result = safeProviderDetail({ message: `Invalid parameter\nkey=${encodeURIComponent(key)} location 12.3456,78.9012` }, key, { lat: 12.3456, lon: 78.9012 });
+  assert.equal(result.includes(key), false);
+  assert.equal(result.includes(encodeURIComponent(key)), false);
+  assert.equal(result.includes('12.3456'), false);
+  assert.equal(result.includes('\n'), false);
+});

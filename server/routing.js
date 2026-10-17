@@ -6,16 +6,36 @@ const failures = {
   QUOTA: [503, 'The route service has reached its request allowance. Please try again later.'],
   TIMEOUT: [504, 'The route service took too long to respond. Please try again.'],
   UNAVAILABLE: [502, 'The route service is temporarily unavailable. Please try again.'],
-  REJECTED: [502, 'The route service rejected this search. Check that the GraphHopper account supports foot, elevation and round-trip routing.'],
+  REJECTED: [502, 'The route service rejected this search.'],
   INVALID_RESPONSE: [502, 'The route service returned incomplete route or elevation data. Please try again.']
 };
 export class RoutingError extends Error {
-  constructor(reason) {
+  constructor(reason, detail = '') {
     const [status, message] = failures[reason] ?? failures.UNAVAILABLE;
-    super(message);
+    super(detail ? `${message} GraphHopper: ${detail}` : message);
     this.status = status;
     this.code = `ROUTING_${reason}`;
   }
+}
+// Surface provider diagnostics without leaking query URLs, API keys or home coordinates.
+export function safeProviderDetail(result, key, target) {
+  const hints = Array.isArray(result?.hints) ? result.hints : [];
+  const messages = [result?.message, ...hints.map(hint => hint?.message)]
+    .filter(message => typeof message === 'string' && message.trim());
+  let text = [...new Set(messages)].join(' · ');
+  if (!text) return '';
+  for (const secret of [key, encodeURIComponent(key ?? '')]) {
+    if (secret) text = text.split(secret).join('[redacted]');
+  }
+  text = text.replace(/https?:\/\/[^\s<>"']+/gi, '[provider URL]')
+    .replace(/\b(?:api[_ -]?key|access[_ -]?token|client[_ -]?secret)\s*[:=]\s*["']?[^\s"',;]+/gi, '[credential redacted]')
+    .replace(/-?\d{1,3}(?:\.\d+)?\s*,\s*-?\d{1,3}(?:\.\d+)?/g, '[location]')
+    .replace(/\b(?:lat(?:itude)?|lon(?:gitude)?|point)\s*[:=]\s*-?\d+(?:\.\d+)?/gi, '[location]');
+  for (const coordinate of [target?.lat, target?.lon]) {
+    const value = String(coordinate);
+    if (value.includes('.') && value.length >= 5) text = text.split(value).join('[location]');
+  }
+  return text.replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 450);
 }
 function validPath(path) {
   const coordinates = path?.points?.coordinates;
@@ -56,7 +76,7 @@ export function createRoutingService({ key, fetcher = fetch }) {
         if (/invalid.*(?:api.?key|key)|(?:api.?key|key).*invalid|not authorized/i.test(diagnostic)) throw new RoutingError('ACCESS');
         const noPath = /PointNotFoundException|ConnectionNotFoundException|cannot find point|cannot find.*route|connection between locations not found/i.test(diagnostic);
         if (response.status === 400 && noPath) continue;
-        throw new RoutingError('REJECTED');
+        throw new RoutingError('REJECTED', safeProviderDetail(result, key, target));
       }
       if (!Array.isArray(result?.paths)) throw new RoutingError('INVALID_RESPONSE');
       const valid = result.paths.filter(validPath);

@@ -92,7 +92,7 @@ Strava tokens stay on the backend; the device stores its opaque session in Keych
 
 ## Validation and release limitations
 
-Routing errors distinguish missing configuration, provider authentication/access failures, quota exhaustion, timeouts, unavailable services, unsupported requests and incomplete elevation/geometry. Provider messages and key-bearing URLs are never returned to the phone. If a seed has no routable point, later candidates are still attempted; an area with no suitable routes returns an empty match list.
+Routing errors distinguish missing configuration, provider authentication/access failures, quota exhaustion, timeouts, unavailable services, unsupported requests and incomplete elevation/geometry. Rejected searches return a sanitized provider explanation so unsupported parameters or profile restrictions can be diagnosed. Key-bearing URLs, the configured key and home coordinates are removed; raw provider responses are not returned. If a seed has no routable point, later candidates are still attempted; an area with no suitable routes returns an empty match list.
 
 Run `cd server && npm test`. These tests use mocked providers and real local HTTP to exercise authentication, maps, matching, history pagination, write permission, activity ownership, note preservation and idempotency. They do not use real credentials or modify live Strava activities.
 
