@@ -33,8 +33,11 @@ struct Dashboard: View {
     @State private var activeTab = 0
     @State private var alternatives: [Int: [Route]] = [:]
     @State private var alternativeErrors: [Int: String] = [:]
+    @State private var closestOptions: [Int: [Route]] = [:]
+    @State private var showingClosest: Set<Int> = []
     @State private var loadingAlternatives: Set<Int> = []
     @State private var detail: Route?
+    @State private var detailClimbingTarget: Double?
     @State private var showingDemo: Bool = SessionStore.read() == nil
     @State private var syncing = false
     @State private var feedVersion = UUID()
@@ -84,9 +87,9 @@ struct Dashboard: View {
         }
         .onChange(of: radius) { _, _ in resetFeedMatches(); routes = []; selected = nil }
         .preferredColorScheme(.dark).tint(accent)
-        .sheet(item: $detail) { route in
+        .sheet(item: $detail, onDismiss: { detailClimbingTarget = nil }) { route in
             RouteDetails(
-                route: route, isDemo: showingDemo, runs: showingDemo ? [] : allHeatRuns,
+                route: route, isDemo: showingDemo, effortWarning: detailClimbingTarget.map { String(format: "Closest option: %.0f m climbing versus your %.0f m target. This route is outside the elevation match tolerance.", route.ascent, $0) }, runs: showingDemo ? [] : allHeatRuns,
                 saved: savedRoutes.first(where: { RouteLibrary.sameGeometry($0.route, route) }),
                 canWrite: account?.writeAuthorized == true,
                 onSave: { remember([route]) },
@@ -128,6 +131,8 @@ struct Dashboard: View {
                             .font(.caption)
                     }
                 }
+                Text("Alternatives are searched near your saved home, not the original run’s starting point.")
+                    .font(.caption).foregroundStyle(.secondary)
                 if let message { Text(message).font(.callout).foregroundStyle(.orange) }
                 if runs.isEmpty {
                     Text(token.isEmpty ? "Connect Strava to see your runs." : "No runs loaded. Refresh to try again.")
@@ -145,7 +150,8 @@ struct Dashboard: View {
         .refreshable { if !token.isEmpty { await sync() } }
     }
     private func feedCard(_ run: Run) -> some View {
-        let matches = showingDemo ? demoAlternatives(for: run) : alternatives[run.id] ?? []
+        let isClosest = showingClosest.contains(run.id) && !showingDemo
+        let matches = showingDemo ? demoAlternatives(for: run) : (isClosest ? closestOptions[run.id] ?? [] : alternatives[run.id] ?? [])
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .top) {
                 Image(systemName: "figure.run").foregroundStyle(accent).padding(.top, 3)
@@ -166,7 +172,7 @@ struct Dashboard: View {
             }
             Divider().overlay(.white.opacity(0.1))
             HStack {
-                Text(showingDemo ? "EXAMPLE ALTERNATIVES" : "MATCHED ALTERNATIVES")
+                Text(showingDemo ? "EXAMPLE ALTERNATIVES" : (isClosest ? "CLOSEST OPTIONS · ELEVATION DIFFERS" : "MATCHED ALTERNATIVES"))
                     .font(.caption2.bold()).tracking(1)
                 Spacer()
                 if loadingAlternatives.contains(run.id) { ProgressView().controlSize(.small) }
@@ -174,11 +180,17 @@ struct Dashboard: View {
             HStack(alignment: .top, spacing: 10) {
                 ForEach(0..<2, id: \.self) { index in
                     if index < matches.count {
-                        alternativeTile(matches[index], run: run)
+                        alternativeTile(matches[index], run: run, isClosest: isClosest)
                     } else {
                         alternativePlaceholder(run, index: index, count: matches.count)
                     }
                 }
+            }
+            if let options = closestOptions[run.id], !options.isEmpty, !showingDemo {
+                Button(isClosest ? "Hide closest options" : "Show closest options · climbing differs") {
+                    if isClosest { showingClosest.remove(run.id) }
+                    else { showingClosest.insert(run.id) }
+                }.font(.caption.bold())
             }
             if let error = alternativeErrors[run.id], !showingDemo {
                 Text(error).font(.caption).foregroundStyle(.secondary)
@@ -186,6 +198,8 @@ struct Dashboard: View {
                     Button("Retry alternatives") {
                         alternativeErrors[run.id] = nil
                         alternatives[run.id] = nil
+                        closestOptions[run.id] = nil
+                        showingClosest.remove(run.id)
                         Task { await loadAlternatives(for: run, context: feedContext) }
                     }.font(.caption)
                 }
@@ -204,17 +218,25 @@ struct Dashboard: View {
             Text(value).font(.subheadline.bold()).monospacedDigit()
         }
     }
-    private func alternativeTile(_ route: Route, run: Run) -> some View {
-        Button { detail = route } label: {
+    private func alternativeTile(_ route: Route, run: Run, isClosest: Bool) -> some View {
+        Button { detailClimbingTarget = isClosest ? run.total_elevation_gain : nil; detail = route } label: {
             VStack(alignment: .leading, spacing: 7) {
                 RunMap(points: route.points, tint: accent, emptyText: "Map unavailable").frame(height: 105)
                 Text(route.name).font(.caption.bold()).lineLimit(1)
                 Text(String(format: "%.1f km · %.0f m ↑", route.distance / 1000, route.ascent))
                     .font(.caption2).foregroundStyle(.secondary)
-                Text("\(route.match(distance: run.distance, ascent: run.total_elevation_gain))% similar")
-                    .font(.caption.bold()).foregroundStyle(accent)
+                if isClosest {
+                    Text(String(format: "%+.0f m climbing vs run", route.ascent - run.total_elevation_gain))
+                        .font(.caption2.bold()).foregroundStyle(.orange)
+                } else {
+                    Text("\(route.match(distance: run.distance, ascent: run.total_elevation_gain))% similar")
+                        .font(.caption.bold()).foregroundStyle(accent)
+                }
+                Label("View route", systemImage: "arrow.up.right").font(.caption.bold()).foregroundStyle(accent)
             }.frame(maxWidth: .infinity, alignment: .leading).contentShape(Rectangle())
         }.buttonStyle(.plain)
+            .accessibilityLabel("View \(route.name), \(String(format: "%.1f", route.distance / 1000)) kilometres, \(Int(route.ascent)) metres climbing")
+            .accessibilityHint("Opens the route map, GPX export and sharing")
     }
     private func alternativePlaceholder(_ run: Run, index: Int, count: Int) -> some View {
         let text: String
@@ -252,8 +274,10 @@ struct Dashboard: View {
             let result: RouteResponse = try await api.get("runs/\(run.id)/alternatives", query: query)
             guard context == feedContext, !Task.isCancelled else { return }
             alternatives[run.id] = Array(result.routes.prefix(2))
+            closestOptions[run.id] = Array((result.suggestions ?? []).prefix(2))
             remember(result.routes)
-            if result.routes.isEmpty { alternativeErrors[run.id] = "No similar loops found in your home radius. Try changing it in Settings." }
+            if let explanation = result.message { alternativeErrors[run.id] = explanation }
+            else if result.routes.isEmpty { alternativeErrors[run.id] = "No similar loops found in your home radius. Try changing it in Settings." }
         } catch {
             guard context == feedContext else { return }
             if Task.isCancelled { return }
@@ -261,7 +285,7 @@ struct Dashboard: View {
         }
     }
     private func resetFeedMatches() {
-        alternatives = [:]; alternativeErrors = [:]; loadingAlternatives = []
+        alternatives = [:]; alternativeErrors = [:]; loadingAlternatives = []; closestOptions = [:]; showingClosest = []
         feedVersion = UUID()
     }
     private var planner: some View {
@@ -581,6 +605,7 @@ struct GPXDocument: FileDocument {
 struct RouteDetails: View {
     let route: Route
     let isDemo: Bool
+    let effortWarning: String?
     let runs: [Run]
     let saved: SavedRoute?
     let canWrite: Bool
@@ -604,6 +629,7 @@ struct RouteDetails: View {
                 VStack(alignment: .leading, spacing: 20) {
                     RunMap(points: route.points, tint: accent, emptyText: "Route map unavailable").frame(height: 300)
                     Text(String(format: "%.1f km · %.0f m climb", route.distance / 1000, route.ascent)).font(.headline)
+                    if let effortWarning { Text(effortWarning).font(.callout.bold()).foregroundStyle(.orange) }
                     if isDemo {
                         Text("Illustrative demo route. Export and navigation are available for real discovered routes after connection.")
                             .foregroundStyle(.secondary)

@@ -23,6 +23,8 @@ export class NoMatchingRoutesError extends RoutingError {
   constructor(paths, target, original) {
     super('NO_MATCH');
     this.message = noMatchMessage(paths, target, original);
+    const distinct = paths.filter(path => !retraces(path.coordinates, original));
+    this.suggestions = selectRoutes(distinct, target, { allowClimbDifference: true }).slice(0, 2);
   }
 }
 // Surface provider diagnostics without leaking query URLs, API keys or home coordinates.

@@ -18,10 +18,11 @@ export function routeRejections(path, { lat, lon, radius, distance, ascent }) {
   if (Math.abs(path.ascent - ascent) > Math.max(40, ascent * .35)) reasons.push('climb');
   return reasons;
 }
-export function selectRoutes(paths, target) {
+export function selectRoutes(paths, target, { allowClimbDifference = false } = {}) {
   const unique = new Set();
   return paths.filter(path => {
-    if (routeRejections(path, target).length) return false;
+    const failures = routeRejections(path, target).filter(reason => !(allowClimbDifference && reason === 'climb'));
+    if (failures.length) return false;
     const key = path.coordinates.map(point => point.slice(0, 2).map(n => n.toFixed(4)).join(',')).sort().join(';');
     if (unique.has(key)) return false;
     unique.add(key); return true;

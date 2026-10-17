@@ -146,3 +146,18 @@ test('later standard searches calibrate waypoint size from the observed route le
   assert.ok(anchors[1] > anchors[0] * 1.5, 'short first path enlarges subsequent search anchors');
   assert.equal(anchors.length, 2, 'does not add extra quota-consuming requests');
 });
+
+test('no-match exception preserves only usable, novel closest options for the feed', async () => {
+  const hilly = { ...path, ascend: 500 };
+  const generate = createRoutingService({ key: 'test-only', fetcher: async () => Response.json({ paths: [hilly] }) });
+  await assert.rejects(generate(target, [11]), error => {
+    assert.equal(error.code, 'ROUTING_NO_MATCH');
+    assert.equal(error.suggestions.length, 1);
+    assert.equal(error.suggestions[0].ascent, 500);
+    return true;
+  });
+  await assert.rejects(generate(target, [11], hilly.points.coordinates), error => {
+    assert.equal(error.suggestions.length, 0, 'recorded run is not offered as a new alternative');
+    return true;
+  });
+});

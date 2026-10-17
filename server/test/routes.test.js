@@ -34,3 +34,14 @@ test('every filter is reported when a candidate fails multiple matching rules', 
   const bad = { ...route, distance: 20000, ascent: 500, coordinates: [[0, 0], [1, 1], [1, 1]] };
   assert.deepEqual(routeRejections(bad, target), ['radius', 'closure', 'distance', 'climb']);
 });
+
+test('closest options may differ in climbing but still require distance, radius and loop closure', () => {
+  const hilly = { ...route, ascent: 500 };
+  const outside = { ...hilly, coordinates: [[0, 0], [1, 1], [0, 0]] };
+  const long = { ...hilly, distance: 16000 };
+  const open = { ...hilly, coordinates: [[0, 0], [.01, .01], [.02, .02]] };
+  assert.equal(selectRoutes([hilly], target).length, 0);
+  const closest = selectRoutes([hilly, outside, long, open], target, { allowClimbDifference: true });
+  assert.equal(closest.length, 1);
+  assert.equal(closest[0].ascent, 500);
+});

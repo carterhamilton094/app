@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { parseTarget } from './routes.js';
-import { createRoutingService, RoutingError } from './routing.js';
+import { createRoutingService, RoutingError, NoMatchingRoutesError } from './routing.js';
 import { runningActivities, targetForRun, appendRouteNote, historyPage } from './activities.js';
 const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY, GRAPHHOPPER_ROUTING_MODE } = process.env;
 const port = Number(process.env.PORT || 3000);
@@ -147,23 +147,26 @@ export const server = http.createServer(async (req, res) => {
       session.matches ??= new Map();
       const cacheKey = JSON.stringify([match[1], target]);
       const cached = session.matches.get(cacheKey);
-      if (cached && cached.expires > Date.now()) return send(res, 200, { routes: await cached.result });
+      if (cached && cached.expires > Date.now()) return send(res, 200, await cached.result);
       const now = Date.now();
       if (!session.feedBudget || session.feedBudget.expires <= now) session.feedBudget = { count: 0, expires: now + 600000 };
-      if (session.feedBudget.count >= 12 || (session.activeMatches || 0) >= 3) {
+      if (session.feedBudget.count >= 8 || (session.activeMatches || 0) >= 3) {
         return send(res, 429, { error: 'Route searches are busy or at the current limit. Retry shortly; search allowance resets every ten minutes.' });
       }
       // Cache in-flight requests too, so revisiting a card does not spend more quota.
       session.feedBudget.count++;
       session.activeMatches = (session.activeMatches || 0) + 1;
-      const result = generateRoutes(target, [11, 29, 47, 83], workout.run.coordinates)
-        .then(routes => routes.slice(0, 2))
-        .catch(error => { session.matches.delete(cacheKey); throw error; })
+      const result = generateRoutes(target, [11, 29, 47, 83, 107, 139], workout.run.coordinates)
+        .then(routes => ({ routes: routes.slice(0, 2), suggestions: [], message: null }))
+        .catch(error => {
+          if (error instanceof NoMatchingRoutesError) return { routes: [], suggestions: error.suggestions, message: error.message };
+          session.matches.delete(cacheKey); throw error;
+        })
         .finally(() => { session.activeMatches--; });
       session.matches.set(cacheKey, { result, expires: now + 600000 });
       // Keep per-athlete memory bounded as home settings change.
       if (session.matches.size > 50) session.matches.delete(session.matches.keys().next().value);
-      return send(res, 200, { routes: await result });
+      return send(res, 200, await result);
     }
     if (url.pathname === '/routes') {
       if (!GRAPHHOPPER_KEY?.trim()) throw new RoutingError('NOT_CONFIGURED');

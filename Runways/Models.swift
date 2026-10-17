@@ -40,7 +40,11 @@ private func mapPoints(_ coordinates: [[Double]]) -> [CLLocationCoordinate2D] {
         return CLLocationCoordinate2D(latitude: point[1], longitude: point[0])
     }
 }
-struct RouteResponse: Decodable { let routes: [Route] }
+struct RouteResponse: Decodable {
+    let routes: [Route]
+    let suggestions: [Route]?
+    let message: String?
+}
 struct Session: Codable { let session: String }
 
 // Illustrative geometry only; these are not real, navigable running routes.
