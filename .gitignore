@@ -1,0 +1,6 @@
+.DS_Store
+*.xcodeproj/
+DerivedData/
+.env
+node_modules/
+Runways/Info.plist

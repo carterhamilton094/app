@@ -1,0 +1,24 @@
+name: Runways
+options:
+  bundleIdPrefix: com.runways
+  deploymentTarget:
+    iOS: '17.0'
+targets:
+  Runways:
+    type: application
+    platform: iOS
+    sources: [Runways]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.runways.app
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_KEY_NSLocationWhenInUseUsageDescription: Use your location as the starting point for alternative runs.
+        INFOPLIST_KEY_CFBundleDisplayName: Runways
+        SWIFT_VERSION: '5.0'
+    info:
+      path: Runways/Info.plist
+      properties:
+        CFBundleURLTypes:
+          - CFBundleURLSchemes: [runways]
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true

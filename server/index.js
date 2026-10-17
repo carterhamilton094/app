@@ -1,0 +1,83 @@
+import http from 'node:http';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
+import { parseTarget, selectRoutes } from './routes.js';
+const { STRAVA_CLIENT_ID, STRAVA_CLIENT_SECRET, PUBLIC_URL, GRAPHHOPPER_KEY } = process.env;
+const port = Number(process.env.PORT || 3000);
+// Development storage only. Restarting the server requires reconnecting Strava.
+const states = new Map(), tickets = new Map(), sessions = new Map(), limits = new Map();
+const opaque = () => randomBytes(32).toString('hex');
+const send = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end(JSON.stringify(body)); };
+const redirect = (res, location) => { res.writeHead(302, { Location: location, 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' }); res.end(); };
+async function json(url, options) {
+  const response = await fetch(url, { ...options, signal: AbortSignal.timeout(20000) });
+  if (!response.ok) throw new Error(`Upstream service returned ${response.status}`);
+  return response.json();
+}
+async function stravaToken(fields) {
+  return json('https://www.strava.com/oauth/token', { method: 'POST', body: new URLSearchParams({ client_id: STRAVA_CLIENT_ID, client_secret: STRAVA_CLIENT_SECRET, ...fields }) });
+}
+async function access(session) {
+  if (session.tokens.expires_at * 1000 < Date.now() + 60000) session.tokens = await stravaToken({ grant_type: 'refresh_token', refresh_token: session.tokens.refresh_token });
+  return session.tokens.access_token;
+}
+setInterval(() => {
+  for (const map of [states, tickets, sessions, limits]) for (const [key, value] of map) if (value.expires < Date.now()) map.delete(key);
+}, 60000).unref();
+http.createServer(async (req, res) => {
+  try {
+    if (req.method !== 'GET') return send(res, 405, { error: 'Method not allowed' });
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname === '/health') return send(res, 200, { status: 'ok', stravaConfigured: Boolean(STRAVA_CLIENT_ID && STRAVA_CLIENT_SECRET && PUBLIC_URL), routingConfigured: Boolean(GRAPHHOPPER_KEY) });
+    if (url.pathname === '/auth/strava') {
+      if (!STRAVA_CLIENT_ID || !STRAVA_CLIENT_SECRET || !PUBLIC_URL) return send(res, 503, { error: 'Configure Strava on the server first' });
+      const state = opaque(); states.set(state, { expires: Date.now() + 600000 });
+      const auth = new URL('https://www.strava.com/oauth/authorize');
+      auth.search = new URLSearchParams({ client_id: STRAVA_CLIENT_ID, redirect_uri: `${PUBLIC_URL.replace(/\/$/, '')}/auth/callback`, response_type: 'code', approval_prompt: 'auto', scope: 'read,activity:read_all', state });
+      res.setHeader('Set-Cookie', `runways_state=${state}; HttpOnly; Secure; SameSite=Lax; Path=/auth; Max-Age=600`);
+      return redirect(res, auth.toString());
+    }
+    if (url.pathname === '/auth/callback') {
+      const state = url.searchParams.get('state'), pending = states.get(state);
+      const cookie = req.headers.cookie?.split(';').map(c => c.trim()).find(c => c.startsWith('runways_state='))?.slice(14);
+      if (!pending || pending.expires < Date.now() || !cookie || cookie.length !== state.length || !timingSafeEqual(Buffer.from(cookie), Buffer.from(state))) return send(res, 400, { error: 'Invalid or expired authorization state' });
+      states.delete(state);
+      if (!url.searchParams.get('code') || !url.searchParams.get('scope')?.split(',').includes('activity:read_all')) return send(res, 400, { error: 'Activity access was not granted. Reconnect and allow activity access.' });
+      const tokens = await stravaToken({ grant_type: 'authorization_code', code: url.searchParams.get('code') });
+      const ticket = opaque(); tickets.set(ticket, { tokens, expires: Date.now() + 60000 });
+      return redirect(res, `runways://connected?ticket=${ticket}`);
+    }
+    if (url.pathname === '/auth/exchange') {
+      const ticket = url.searchParams.get('ticket'), entry = tickets.get(ticket); tickets.delete(ticket);
+      if (!entry || entry.expires < Date.now()) return send(res, 401, { error: 'Connection ticket expired' });
+      const session = opaque(); sessions.set(session, { tokens: entry.tokens, expires: Date.now() + 30 * 86400000 });
+      return send(res, 200, { session });
+    }
+    const key = req.headers.authorization?.replace(/^Bearer /, ''), session = sessions.get(key);
+    if (!session || session.expires < Date.now()) return send(res, 401, { error: 'Reconnect Strava to continue' });
+    if (url.pathname === '/disconnect') {
+      await json('https://www.strava.com/oauth/deauthorize', { method: 'POST', body: new URLSearchParams({ access_token: await access(session) }) });
+      sessions.delete(key); return send(res, 200, { session: '' });
+    }
+    if (url.pathname === '/runs') {
+      const activities = await json('https://www.strava.com/api/v3/athlete/activities?per_page=100', { headers: { Authorization: `Bearer ${await access(session)}` } });
+      return send(res, 200, activities.filter(a => ['Run', 'TrailRun', 'VirtualRun'].includes(a.sport_type)).map(({ id, name, distance, total_elevation_gain, moving_time, start_date }) => ({ id, name, distance, total_elevation_gain, moving_time, start_date })));
+    }
+    if (url.pathname === '/routes') {
+      if (!GRAPHHOPPER_KEY) return send(res, 503, { error: 'Configure GRAPHHOPPER_KEY on the server for live route generation' });
+      let target; try { target = parseTarget(url.searchParams); } catch (e) { return send(res, 400, { error: e.message }); }
+      const rate = limits.get(key);
+      if (rate && rate.expires > Date.now()) return send(res, 429, { error: 'Please wait one minute before generating more routes' });
+      limits.set(key, { expires: Date.now() + 60000 });
+      const paths = [];
+      // Sequential requests avoid a burst against the routing provider's quota.
+      for (const seed of [11, 29, 47, 83, 107, 139]) {
+        const endpoint = new URL('https://graphhopper.com/api/1/route');
+        endpoint.search = new URLSearchParams({ key: GRAPHHOPPER_KEY, point: `${target.lat},${target.lon}`, profile: 'foot', algorithm: 'round_trip', 'round_trip.distance': String(target.distance), 'round_trip.seed': String(seed), elevation: 'true', points_encoded: 'false' });
+        const result = await json(endpoint);
+        for (const p of result.paths || []) paths.push({ id: String(seed), name: `Discovery loop ${paths.length + 1}`, distance: p.distance, ascent: p.ascend, coordinates: p.points.coordinates });
+      }
+      return send(res, 200, { routes: selectRoutes(paths, target) });
+    }
+    send(res, 404, { error: 'Not found' });
+  } catch { send(res, 502, { error: 'The upstream service could not complete this request. Check server credentials, provider quota and connectivity.' }); }
+}).listen(port, '0.0.0.0', () => console.log(`Runways backend listening on ${port}`));
